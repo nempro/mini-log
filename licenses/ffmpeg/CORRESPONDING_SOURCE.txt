@@ -1,0 +1,24 @@
+FFmpeg corresponding source information for Mini Log 0.1.0
+===========================================================
+
+The bundled executable is the verified Windows x86_64 FFmpeg 7.1 Essentials
+build identified in BUILD_INFO.txt. Its release record identifies the FFmpeg
+source revision as b08d7969c5.
+
+FFmpeg source revision:
+https://github.com/FFmpeg/FFmpeg/tree/b08d7969c5
+
+Source archive for that revision:
+https://github.com/FFmpeg/FFmpeg/archive/b08d7969c5.tar.gz
+
+Build publisher record:
+https://github.com/GyanD/codexffmpeg/releases/tag/7.1
+
+Build configuration is recorded verbatim in BUILD_INFO.txt. The static
+Windows build also enables external libraries. Before publishing a modified
+replacement binary, provide the complete corresponding source, including the
+matching external-library sources and any patches, together with that release.
+Do not substitute a different FFmpeg executable without updating these files
+and verifying its license obligations.
+
+This is an attribution and source-location notice, not legal advice.

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+/build/
+/dist/
+/release/
+/output/
+.codex/
+*.minilog
+*.mp4
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.tmp
+*.log

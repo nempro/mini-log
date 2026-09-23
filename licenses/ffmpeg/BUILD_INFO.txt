@@ -1,0 +1,38 @@
+Mini Log 0.1.0 — bundled FFmpeg build information
+===================================================
+
+Binary
+------
+Path: ffmpeg/ffmpeg.exe
+Version reported by the binary: ffmpeg version 7.1-essentials_build-www.gyan.dev
+Architecture: Windows x86_64
+SHA-256: 2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3
+Binary origin for Mini Log's build: imageio-ffmpeg 0.6.0 wheel
+Original Windows build publisher: https://www.gyan.dev/ffmpeg/builds/
+Original build release record: https://github.com/GyanD/codexffmpeg/releases/tag/7.1
+
+License
+-------
+The exact binary reports both --enable-gpl and --enable-version3 in its
+configuration. It is therefore distributed here under GNU GPL version 3 or
+later. The full GNU GPL v3 text is COPYING.GPLv3.txt.
+
+FFmpeg's official licensing guidance:
+https://ffmpeg.org/legal.html
+
+Observed configure line
+-----------------------
+--enable-gpl --enable-version3 --enable-static --disable-w32threads
+--disable-autodetect --enable-fontconfig --enable-iconv --enable-gnutls
+--enable-libxml2 --enable-gmp --enable-bzlib --enable-lzma --enable-zlib
+--enable-libsrt --enable-libssh --enable-libzmq --enable-avisynth --enable-sdl2
+--enable-libwebp --enable-libx264 --enable-libx265 --enable-libxvid
+--enable-libaom --enable-libopenjpeg --enable-libvpx --enable-mediafoundation
+--enable-libass --enable-libfreetype --enable-libfribidi --enable-libharfbuzz
+--enable-libvidstab --enable-libvmaf --enable-libzimg --enable-amf
+--enable-cuda-llvm --enable-cuvid --enable-dxva2 --enable-d3d11va
+--enable-d3d12va --enable-ffnvcodec --enable-libvpl --enable-nvdec
+--enable-nvenc --enable-vaapi --enable-libgme --enable-libopenmpt
+--enable-libopencore-amrwb --enable-libmp3lame --enable-libtheora
+--enable-libvo-amrwbenc --enable-libgsm --enable-libopencore-amrnb
+--enable-libopus --enable-libspeex --enable-libvorbis --enable-librubberband
