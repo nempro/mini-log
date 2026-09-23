@@ -14,7 +14,7 @@ Mini Logは、複数の写真から短い縦型Vlogを作るWindows向けデス�
 
 ## Download
 
-[GitHub Releases](../../releases) から最新版の `MiniLog-0.1.0-windows.zip` をダウンロードし、ZIPを展開して `MiniLog.exe` を起動してください。Pythonや別途FFmpegの導入は不要です。
+[Mini Log 0.1.0 Release](https://github.com/nempro/mini-log/releases/tag/v0.1.0) から `MiniLog-0.1.0-windows.zip` をダウンロードし、ZIPを展開して `MiniLog.exe` を起動してください。Pythonや別途FFmpegの導入は不要です。
 
 ## Usage
 
