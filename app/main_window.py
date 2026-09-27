@@ -1527,6 +1527,9 @@ class MiniLogApp:
         if path and Path(path).is_file():
             if self.player.playing:
                 self.stop_preview()
+            # The slider is the value the user just chose. Synchronize it before
+            # preparing audio, even if its Scale callback has not run yet.
+            self._on_bgm_volume_changed(self.bgm_volume_var.get())
             self.audio_audition.play("bgm", path, self.project.bgm_volume)
 
     def toggle_cut_audio_audition(self) -> None:
@@ -1537,6 +1540,7 @@ class MiniLogApp:
         if cut is not None and cut.audio_path and Path(cut.audio_path).is_file():
             if self.player.playing:
                 self.stop_preview()
+            self._on_cut_audio_volume_changed(self.cut_audio_volume_var.get())
             self.audio_audition.play("cut", cut.audio_path, cut.audio_volume, owner_id=cut.id)
 
     def _add_material_paths(self, paths, source: str = "選択") -> int:
