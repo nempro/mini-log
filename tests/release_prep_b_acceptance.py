@@ -120,7 +120,7 @@ def main() -> None:
             restored = Project.load(project_path)
             assert restored.to_dict() == project.to_dict()
 
-            final = ARTIFACTS / "mini-log-0.1.0-phone-check.mp4"
+            final = ARTIFACTS / f"mini-log-{__version__}-phone-check.mp4"
             export_project(restored, final, settings=FINAL_RENDER)
             probe = _probe(ffmpeg, final)
             assert "Video: h264" in probe and "1080x1920" in probe and "30 fps" in probe
@@ -128,7 +128,7 @@ def main() -> None:
             _decode_all(ffmpeg, final)
 
             silent = Project(cuts=[Cut(str(inputs[0]), duration=0.6)])
-            silent_output = ARTIFACTS / "mini-log-0.1.0-silent-check.mp4"
+            silent_output = ARTIFACTS / f"mini-log-{__version__}-silent-check.mp4"
             export_project(silent, silent_output, settings=FINAL_RENDER)
             _decode_all(ffmpeg, silent_output)
         finally:
@@ -150,7 +150,7 @@ def main() -> None:
         "zip_extract_checked": True,
         "bundled_ffmpeg_only": True,
         "project_roundtrip": True,
-        "phone_check_mp4": str(ARTIFACTS / "mini-log-0.1.0-phone-check.mp4"),
+        "phone_check_mp4": str(ARTIFACTS / f"mini-log-{__version__}-phone-check.mp4"),
         "h264_aac_1080x1920_30fps_yuv420p": True,
         "silent_mp4_decode": True,
     }

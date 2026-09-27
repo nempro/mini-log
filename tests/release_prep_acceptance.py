@@ -111,7 +111,7 @@ def main() -> None:
                 Cut(str(inputs[1]), duration=0.6, caption_text="Export"),
             ],
             style="Soft",
-            caption_text="Mini Log 0.1.0",
+            caption_text=f"Mini Log {__version__}",
             caption_duration=0.4,
             bgm_path=str(bgm),
             bgm_volume=0.6,

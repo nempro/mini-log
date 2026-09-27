@@ -1,5 +1,5 @@
-FFmpeg corresponding source information for Mini Log 0.1.0
-===========================================================
+FFmpeg corresponding source information for Mini Log
+===================================================
 
 The bundled executable is the verified Windows x86_64 FFmpeg 7.1 Essentials
 build identified in BUILD_INFO.txt. Its release record identifies the FFmpeg

@@ -4,12 +4,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import ImageFont
+from PIL import ImageChops, ImageFont
 
 from app.exporter import (
     HEIGHT,
     MOTION_SCALE,
     PREVIEW_RENDER,
+    FINAL_RENDER,
     WIDTH,
     _caption_layout,
     _cut_caption_lines,
@@ -19,13 +20,22 @@ from app.exporter import (
     build_cut_audio_filter,
     build_bgm_filter,
     build_video_filter,
+    build_video_audio_filter,
     cut_caption_y,
     find_ffmpeg,
+    settings_for_project,
 )
-from app.models import Cut
+from app.models import Cut, Project
 
 
 class ExporterTests(unittest.TestCase):
+    def test_render_settings_follow_project_ratio(self):
+        project = Project(aspect_ratio="3:4")
+        self.assertEqual((settings_for_project(project, PREVIEW_RENDER).width,
+                          settings_for_project(project, PREVIEW_RENDER).height), (360, 480))
+        self.assertEqual((settings_for_project(project, FINAL_RENDER).width,
+                          settings_for_project(project, FINAL_RENDER).height), (1080, 1440))
+
     def test_ffmpeg_is_available(self):
         self.assertTrue(find_ffmpeg())
 
@@ -83,6 +93,16 @@ class ExporterTests(unittest.TestCase):
         large = build_cut_caption_panel("今日はここから。", 360, 640, "gothic", "large")
         self.assertGreater(large.height, small.height)
 
+    def test_cut_caption_styles_have_distinct_artwork(self):
+        panels = {
+            style: build_cut_caption_panel("今日の記録。", 360, 640, "gothic", "medium", style)
+            for style in ("band", "soft_band", "outline", "shadow")
+        }
+        self.assertEqual(len({panel.tobytes() for panel in panels.values()}), 4)
+        self.assertGreater(panels["band"].getpixel((panels["band"].width // 2, 2))[3],
+                           panels["soft_band"].getpixel((panels["soft_band"].width // 2, 2))[3])
+        self.assertTrue(ImageChops.difference(panels["outline"], panels["shadow"]).getbbox())
+
     def test_cut_caption_long_text_uses_at_most_four_lines(self):
         font = ImageFont.truetype(str(_font_path("gothic")), size=58)
         lines = _cut_caption_lines(
@@ -134,6 +154,14 @@ class ExporterTests(unittest.TestCase):
         self.assertIn("atrim=start=0:duration=2.500", value)
         self.assertIn("asetpts=PTS-STARTPTS", value)
         self.assertIn("adelay=4500|4500", value)
+
+    def test_video_audio_filter_trims_sets_volume_and_offsets_to_cut_start(self):
+        value = build_video_audio_filter(1.75, 0.6, 2.25)
+        self.assertIn("aresample=48000", value)
+        self.assertIn("channel_layouts=stereo", value)
+        self.assertIn("volume=0.6000", value)
+        self.assertIn("atrim=start=0:duration=1.750", value)
+        self.assertIn("adelay=2250|2250", value)
 
 
 if __name__ == "__main__":

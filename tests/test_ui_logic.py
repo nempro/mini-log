@@ -33,7 +33,7 @@ from scripts.release_documents import distribution_readme, third_party_notices
 
 class UiLogicTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(__version__, "0.1.0")
+        self.assertEqual(__version__, "0.2.0")
 
     def test_release_text_uses_the_single_version_source(self):
         self.assertIn(f"Mini Log {__version__}", distribution_readme())
@@ -196,6 +196,8 @@ class UiLogicTests(unittest.TestCase):
         self.assertEqual(clamp_cut_duration(0), 0.5)
         self.assertEqual(clamp_cut_duration(1.56), 1.6)
         self.assertEqual(clamp_cut_duration(50), 30.0)
+        self.assertEqual(clamp_cut_duration(50, 75.0, is_video=True), 50.0)
+        self.assertEqual(clamp_cut_duration(90, 75.0, is_video=True), 75.0)
 
 
 if __name__ == "__main__":

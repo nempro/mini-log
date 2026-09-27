@@ -53,6 +53,8 @@ def main() -> None:
     assert app.cut_caption_motion_var.get() == "フェード"
     assert app.caption_text.get("1.0", END).rstrip("\n") == "今日のまとめ。"
     assert app.preview_photo is not None
+    app.right_canvas.yview_moveto(1.0)
+    root.update()
     export_bottom = app.export_button.winfo_rooty() + app.export_button.winfo_height()
     window_bottom = root.winfo_rooty() + root.winfo_height()
     assert export_bottom <= window_bottom

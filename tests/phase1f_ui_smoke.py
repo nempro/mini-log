@@ -85,7 +85,7 @@ def main() -> None:
     assert not app.card_duration_minus_buttons[0].bind("<B1-Motion>")
     assert not app.card_duration_plus_buttons[0].bind("<B1-Motion>")
 
-    app.select_cut(1, additive=True)
+    app.select_cut(1)
     first_duration = app.project.cuts[0].duration
     app.card_duration_plus_buttons[1].invoke()
     root.update()

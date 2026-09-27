@@ -49,9 +49,15 @@ class PreviewPlayer:
         self.audio_path = Path(self.audio_temp.name) / "preview.wav"
         self.audio_ready = False
         self.audio_started = False
+        self.display_width = DISPLAY_WIDTH
+        self.display_height = DISPLAY_HEIGHT
 
-    def play(self, path: str | Path, start_seconds: float, duration: float) -> None:
+    def play(
+        self, path: str | Path, start_seconds: float, duration: float,
+        display_size: tuple[int, int] = (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+    ) -> None:
         self.stop(notify=False)
+        self.display_width, self.display_height = display_size
         self.token += 1
         token = self.token
         self.frames = queue.Queue(maxsize=4)
@@ -75,7 +81,7 @@ class PreviewPlayer:
                 str(path),
                 "-an",
                 "-vf",
-                f"scale={DISPLAY_WIDTH}:{DISPLAY_HEIGHT}:flags=bilinear",
+                f"scale={self.display_width}:{self.display_height}:flags=bilinear",
                 "-pix_fmt",
                 "rgb24",
                 "-f",
@@ -93,7 +99,7 @@ class PreviewPlayer:
         self.root.after(1, lambda: self._tick(token))
 
     def _read_frames(self, token: int) -> None:
-        frame_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * 3
+        frame_size = self.display_width * self.display_height * 3
         stdout = self.process.stdout if self.process else None
         if stdout is None:
             return
@@ -146,7 +152,7 @@ class PreviewPlayer:
             self.root.after(max(1, round(wait_seconds * 1000)), lambda: self._tick(token))
             return
 
-        self.on_frame(self.pending, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+        self.on_frame(self.pending, self.display_width, self.display_height)
         self.pending = None
         self.frame_index += 1
         self.on_position(min(self.duration, self.start_offset + self.frame_index / FPS))

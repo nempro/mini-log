@@ -7,6 +7,7 @@ Usage from the project root:
 from __future__ import annotations
 
 import os
+import argparse
 import shutil
 import sys
 import zipfile
@@ -42,7 +43,7 @@ def _find_ffmpeg_source() -> Path:
             if sha256sum(candidate) == FFMPEG_SHA256:
                 return candidate
             raise SystemExit(
-                "Mini Log 0.1.0は検証済みのFFmpeg 7.1 binaryだけを同梱できます。"
+                f"Mini Log {__version__}は検証済みのFFmpeg 7.1 binaryだけを同梱できます。"
             )
         raise SystemExit(f"MINILOG_BUILD_FFMPEGが見つかりません: {candidate}")
 
@@ -139,6 +140,21 @@ def _create_release_zip(release: Path) -> Path:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Build the Windows Mini Log distribution.")
+    parser.add_argument(
+        "--output-name",
+        default=f"MiniLog-{__version__}",
+        help="Folder name under release/ (default: versioned release folder)",
+    )
+    parser.add_argument(
+        "--no-zip",
+        action="store_true",
+        help="Do not create or replace the versioned release ZIP",
+    )
+    arguments = parser.parse_args()
+    if not arguments.output_name.startswith("MiniLog-") or Path(arguments.output_name).name != arguments.output_name:
+        raise SystemExit("--output-nameにはMiniLog-で始まるフォルダ名を指定してください。")
+
     if os.name != "nt":
         raise SystemExit("Windows版ビルドはWindows上で実行してください。")
     try:
@@ -186,7 +202,7 @@ def main() -> None:
     if not (built / "MiniLog.exe").is_file():
         raise SystemExit("PyInstallerの出力にMiniLog.exeがありません。")
 
-    release = ROOT / "release" / f"MiniLog-{__version__}"
+    release = ROOT / "release" / arguments.output_name
     _safe_replace_directory(built, release)
     ffmpeg_target = release / "ffmpeg" / "ffmpeg.exe"
     ffmpeg_target.parent.mkdir(parents=True, exist_ok=True)
@@ -194,13 +210,14 @@ def main() -> None:
     (release / "VERSION.txt").write_text(f"Mini Log {__version__}\n", encoding="utf-8")
     shutil.copytree(licenses, release / "licenses")
     write_distribution_documents(release)
-    archive = _create_release_zip(release)
+    archive = None if arguments.no_zip else _create_release_zip(release)
 
     size = sum(path.stat().st_size for path in release.rglob("*") if path.is_file())
     print(f"Built: {release}")
     print(f"Version: {__version__}")
     print(f"Bundled FFmpeg: {ffmpeg_target}")
-    print(f"Release ZIP: {archive}")
+    if archive is not None:
+        print(f"Release ZIP: {archive}")
     print(f"Size: {size / (1024 * 1024):.1f} MiB")
 
 

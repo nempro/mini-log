@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
+from typing import Callable
 from tkinter import (
     BOTH,
     END,
@@ -19,6 +22,7 @@ from tkinter import (
     X,
     Y,
     Canvas,
+    BooleanVar,
     DoubleVar,
     Frame,
     StringVar,
@@ -38,9 +42,24 @@ from .exporter import (
     cut_caption_y,
     export_project,
     find_ffmpeg,
+    probe_video,
+    probe_video_dimensions,
 )
-from .models import MAX_CUT_DURATION, MIN_CUT_DURATION, SUPPORTED_AUDIO_SUFFIXES, Cut, Project
+from .models import (
+    MAX_CUT_DURATION,
+    MIN_CUT_DURATION,
+    SUPPORTED_AUDIO_SUFFIXES,
+    SUPPORTED_IMAGE_SUFFIXES,
+    SUPPORTED_VIDEO_SUFFIXES,
+    Cut,
+    Project,
+)
+from .look_engine import (
+    PRESET_IDS, PRESET_LOOKS, LookError, apply_still_look,
+    preset_label, preset_lut, validate_cube,
+)
 from .preview_player import PreviewPlayer
+from .audio_audition import AudioAudition
 from .resources import ICON_ICO, ICON_PNG
 from .themes import THEME_LABELS, THEME_VALUES, Theme, get_theme
 from .version import __version__
@@ -119,7 +138,7 @@ def next_available_mp4_name(directory: str | Path, stem: str = "mini-log") -> st
             return candidate
     return f"{stem}-9999.mp4"
 
-CUT_TYPE_LABELS = {"Still": "静止画", "Motion": "動画風"}
+CUT_TYPE_LABELS = {"Still": "静止画", "Motion": "動画風", "Video": "動画"}
 MOTION_TYPE_LABELS = {
     "Zoom In": "ズームイン",
     "Zoom Out": "ズームアウト",
@@ -127,6 +146,15 @@ MOTION_TYPE_LABELS = {
     "Pan Right": "右へパン",
 }
 STYLE_LABELS = {"Natural": "ナチュラル", "Soft": "ソフト", "Film": "フィルム"}
+TRANSITION_LABELS = {
+    "cut": "なし",
+    "fade": "フェード",
+    "crossfade": "クロスフェード",
+    "dip_black": "ブラックを挟む",
+}
+TRANSITION_VALUES = {label: key for key, label in TRANSITION_LABELS.items()}
+TRANSITION_DURATION_LABELS = {0.2: "0.2秒", 0.4: "0.4秒", 0.6: "0.6秒"}
+TRANSITION_DURATION_VALUES = {label: value for value, label in TRANSITION_DURATION_LABELS.items()}
 CAPTION_POSITION_LABELS = {"top": "上", "center": "中央", "bottom": "下"}
 CAPTION_MOTION_LABELS = {
     "fixed": "固定",
@@ -141,7 +169,12 @@ CAPTION_FONT_LABELS = {
     "pop": "ポップ",
 }
 CAPTION_SIZE_LABELS = {"small": "小", "medium": "中", "large": "大"}
+CAPTION_STYLE_LABELS = {
+    "band": "帯", "soft_band": "薄帯", "outline": "縁取り", "shadow": "影",
+}
+CAPTION_STYLE_VALUES = {label: key for key, label in CAPTION_STYLE_LABELS.items()}
 NO_MOTION_LABEL = "— 静止画では使用しません"
+VIDEO_NO_MOTION_LABEL = "— 動画素材を再生します"
 CUT_TYPE_VALUES = {label: value for value, label in CUT_TYPE_LABELS.items()}
 MOTION_TYPE_VALUES = {label: value for value, label in MOTION_TYPE_LABELS.items()}
 STYLE_VALUES = {label: value for value, label in STYLE_LABELS.items()}
@@ -152,14 +185,24 @@ CAPTION_SIZE_VALUES = {label: value for value, label in CAPTION_SIZE_LABELS.item
 DURATION_STEP = 0.1
 
 
-def clamp_cut_duration(value: float) -> float:
-    return round(max(MIN_CUT_DURATION, min(float(value), MAX_CUT_DURATION)), 1)
+def clamp_cut_duration(value: float, media_duration: float | None = None, *, is_video: bool = False) -> float:
+    upper = media_duration if is_video and media_duration is not None and media_duration > 0 else (
+        None if is_video else MAX_CUT_DURATION
+    )
+    lower = min(MIN_CUT_DURATION, upper) if upper is not None else MIN_CUT_DURATION
+    duration = round(max(lower, float(value)), 1)
+    return min(upper, duration) if upper is not None else duration
 
 
 class MiniLogApp:
     def __init__(self, root) -> None:
         self.root = root
         self.project = Project()
+        self._saved_project_signature = self._project_signature()
+        self._loaded_look_lut_path: str | None = None
+        self._loaded_look_strength = 1.0
+        self._preset_strengths: dict[str, float] = {}
+        self._look_warning = ""
         self.theme: Theme = get_theme(self.project.theme)
         self.project_path: Path | None = None
         self.selected_index: int | None = None
@@ -171,9 +214,12 @@ class MiniLogApp:
         self.card_motion_combos: list[ttk.Combobox] = []
         self.card_selection_bars: list[ttk.Frame] = []
         self.card_duration_entries: list[ttk.Entry] = []
+        self.card_duration_vars: list[StringVar] = []
         self.card_duration_minus_buttons: list[ttk.Button] = []
         self.card_duration_plus_buttons: list[ttk.Button] = []
         self.card_duration_frames: list[Frame] = []
+        self.card_duration_committers: list[Callable[[], object]] = []
+        self._rebuilding_cut_list = False
         self.drag_source_index: int | None = None
         self.drag_target_index: int | None = None
         self.drag_start_y: int | None = None
@@ -200,7 +246,10 @@ class MiniLogApp:
         self._suspend_dirty = False
         self._suspend_cut_caption = False
         self._suspend_cut_audio = False
+        self._suspend_video_audio = False
         self._suspend_theme = False
+        self.preview_visible = True
+        self.video_preview_frame_cache: dict[str, Image.Image] = {}
         self.raw_text_widgets: list[Text] = []
         self.window_icon: ImageTk.PhotoImage | None = None
         self.player = PreviewPlayer(
@@ -208,6 +257,9 @@ class MiniLogApp:
             self._show_preview_frame,
             self._update_playback_position,
             self._on_playback_state,
+        )
+        self.audio_audition = AudioAudition(
+            self.root, self._on_audition_state, lambda message: self.status_var.set(message),
         )
 
         self.root.title("Mini Log — Photo Vlog Maker")
@@ -223,6 +275,7 @@ class MiniLogApp:
         self._register_drop_target(self.preview_label)
         self._refresh_all()
         self.root.bind("<Delete>", self._on_delete_key, add="+")
+        self.root.bind("<Control-a>", self._on_select_all_cuts, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_window_icon(self) -> None:
@@ -249,6 +302,14 @@ class MiniLogApp:
         style.configure("Header.TFrame", background=theme.surface_alt)
         style.configure("Panel.TFrame", background=theme.surface)
         style.configure("Surface.TFrame", background=theme.surface, relief="solid", borderwidth=1, bordercolor=theme.border)
+        style.configure(
+            "Scope.TLabelframe", background=theme.surface, relief="solid",
+            borderwidth=1, bordercolor=theme.border,
+        )
+        style.configure(
+            "Scope.TLabelframe.Label", background=theme.surface, foreground=theme.text,
+            font=("Yu Gothic UI", 12, "bold"),
+        )
         style.configure("Card.TFrame", background=theme.surface, relief="solid", borderwidth=1, bordercolor=theme.border)
         style.configure("SelectedCard.TFrame", background=theme.selected_background, relief="solid", borderwidth=1, bordercolor=theme.selected_border)
         style.configure("DropTargetCard.TFrame", background=theme.accent_soft, relief="solid", borderwidth=2, bordercolor=theme.accent)
@@ -390,7 +451,8 @@ class MiniLogApp:
         ttk.Button(actions, text="このアプリについて", command=self.show_about).pack(side=LEFT, padx=3)
         ttk.Button(actions, text="プロジェクトを開く", command=self.open_project).pack(side=LEFT, padx=3)
         ttk.Button(actions, text="プロジェクトを保存", command=self.save_project).pack(side=LEFT, padx=3)
-        ttk.Button(actions, text="画像を追加", style="Accent.TButton", command=self.add_images).pack(side=LEFT, padx=(12, 3))
+        ttk.Button(actions, text="新しいプロジェクト", command=self.new_project).pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="画像 / 動画を追加", style="Accent.TButton", command=self.add_materials).pack(side=LEFT, padx=(12, 3))
 
         theme_box = ttk.Frame(header, style="Header.TFrame")
         theme_box.pack(side=RIGHT, padx=(0, 16))
@@ -413,9 +475,6 @@ class MiniLogApp:
         right_shell = ttk.Frame(self.paned, style="Surface.TFrame")
         self.paned.add(left, weight=3)
         self.paned.add(right_shell, weight=2)
-        right_footer = ttk.Frame(right_shell, style="Panel.TFrame", padding=(18, 8, 18, 18))
-        right_footer.pack(side="bottom", fill=X)
-
         left_head = ttk.Frame(left, style="Panel.TFrame")
         left_head.pack(fill=X, pady=(0, 10))
         ttk.Label(left_head, text="カット", style="Section.TLabel").pack(side=LEFT)
@@ -450,7 +509,7 @@ class MiniLogApp:
         self.right_canvas.pack(side=LEFT, fill=BOTH, expand=True)
         right_scrollbar.pack(side=RIGHT, fill=Y)
         self._build_right_panel(right)
-        self._build_export_panel(right_footer)
+        self._build_export_panel(right)
 
         footer = ttk.Frame(self.root, padding=(24, 0, 24, 18))
         footer.pack(fill=X)
@@ -473,6 +532,19 @@ class MiniLogApp:
             parent=self.root,
         )
 
+    def toggle_preview_visibility(self) -> None:
+        self.preview_visible = not self.preview_visible
+        if self.preview_visible:
+            self.preview_area.pack(fill=X, after=self.preview_heading)
+            self.preview_toggle_button.configure(text="プレビューを隠す")
+            self.status_var.set("プレビューを表示しました")
+        else:
+            if self.player.playing:
+                self.stop_preview()
+            self.preview_area.pack_forget()
+            self.preview_toggle_button.configure(text="プレビューを表示")
+            self.status_var.set("プレビューを隠しました")
+
     def _show_progress(self, text: str = "処理中…") -> None:
         self.progress_text_var.set(text)
         self.progress["value"] = 0
@@ -483,31 +555,86 @@ class MiniLogApp:
         self.progress_box.pack_forget()
 
     def _build_right_panel(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="プレビュー", style="Section.TLabel").pack(anchor="w")
+        right_parent = parent
+        whole_group = ttk.LabelFrame(
+            right_parent, text="動画全体", style="Scope.TLabelframe", padding=(12, 8),
+        )
+        self.whole_scope = whole_group
+        parent = whole_group
+        ttk.Label(parent, text="LOOK（動画全体の色）", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
+        look_settings = ttk.Frame(parent, style="Panel.TFrame")
+        look_settings.pack(fill=X, pady=(0, 12))
+        ttk.Label(look_settings, text="LOOK", style="Panel.TLabel").grid(row=0, column=0, sticky="w", pady=5)
+        self.look_mode_var = StringVar(value="オリジナル")
+        self.look_mode_combo = ttk.Combobox(
+            look_settings, textvariable=self.look_mode_var,
+            values=("オリジナル", *(label for _preset_id, label, _description in PRESET_LOOKS), "カスタムLUT"),
+            state="readonly", width=15,
+        )
+        self.look_mode_combo.grid(row=0, column=1, sticky="ew", padx=(14, 0), pady=5)
+        self.look_mode_combo.bind("<<ComboboxSelected>>", self._on_look_mode_changed)
+        self.look_name_var = StringVar(value="未設定")
+        self.look_name_label = ttk.Label(look_settings, textvariable=self.look_name_var, style="PanelMuted.TLabel")
+        self.look_name_label.grid(
+            row=1, column=1, sticky="w", padx=(14, 0), pady=(0, 4)
+        )
+        self.look_lut_button = ttk.Button(look_settings, text="カスタムLUTを読み込む", command=self.choose_look_lut)
+        self.look_lut_button.grid(
+            row=2, column=1, sticky="w", padx=(14, 0), pady=(0, 5)
+        )
+        ttk.Label(look_settings, text="強度", style="Panel.TLabel").grid(row=3, column=0, sticky="w", pady=5)
+        look_strength_row = ttk.Frame(look_settings, style="Panel.TFrame")
+        look_strength_row.grid(row=3, column=1, sticky="ew", padx=(14, 0), pady=5)
+        self.look_strength_var = DoubleVar(value=100.0)
+        self.look_strength_scale = ttk.Scale(
+            look_strength_row, from_=0, to=100, variable=self.look_strength_var,
+            command=self._on_look_strength_changed, state="disabled",
+        )
+        self.look_strength_scale.pack(side=LEFT, fill=X, expand=True)
+        self.look_strength_label_var = StringVar(value="100%")
+        ttk.Label(
+            look_strength_row, textvariable=self.look_strength_label_var,
+            style="Panel.TLabel", width=5,
+        ).pack(side=RIGHT, padx=(8, 0))
+        look_settings.columnconfigure(1, weight=1)
+
+        parent = right_parent
+        preview_heading = ttk.Frame(parent, style="Panel.TFrame")
+        self.preview_heading = preview_heading
+        preview_heading.pack(fill=X)
+        ttk.Label(preview_heading, text="プレビュー", style="Section.TLabel").pack(side=LEFT)
+        self.preview_toggle_button = ttk.Button(
+            preview_heading,
+            text="プレビューを隠す",
+            command=self.toggle_preview_visibility,
+        )
+        self.preview_toggle_button.pack(side=RIGHT)
+        self.preview_area = ttk.Frame(parent, style="Panel.TFrame")
+        self.preview_area.pack(fill=X)
         self.preview_label = ttk.Label(
-            parent,
-            text="カットを選ぶとここに表示されます\n画像のドロップでも追加できます",
+            self.preview_area,
+            text="カットを選ぶとここに表示されます\n画像 / 動画のドロップでも追加できます",
             anchor="center",
             justify="center",
             style="PanelMuted.TLabel",
         )
         self.preview_label.pack(fill=BOTH, expand=True, pady=(8, 8))
-        self.preview_meta = ttk.Label(parent, text="", style="PanelMuted.TLabel")
+        self.preview_meta = ttk.Label(self.preview_area, text="", style="PanelMuted.TLabel")
         self.preview_meta.pack(anchor="center", pady=(0, 6))
 
         self.preview_state_var = StringVar(value="プレビューはまだありません")
         self.preview_state_label = ttk.Label(
-            parent,
+            self.preview_area,
             textvariable=self.preview_state_var,
             style="AccentMuted.TLabel",
         )
         self.preview_state_label.pack(anchor="center")
         self.preview_time_var = StringVar(value="00:00 / 00:00")
-        ttk.Label(parent, textvariable=self.preview_time_var, style="Panel.TLabel").pack(anchor="center", pady=(2, 7))
+        ttk.Label(self.preview_area, textvariable=self.preview_time_var, style="Panel.TLabel").pack(anchor="center", pady=(2, 7))
 
-        self.preview_create_button = ttk.Button(parent, text="プレビューを作成", command=self.start_preview)
+        self.preview_create_button = ttk.Button(self.preview_area, text="プレビューを作成", command=self.start_preview)
         self.preview_create_button.pack(fill=X, pady=(0, 6))
-        playback = ttk.Frame(parent, style="Panel.TFrame")
+        playback = ttk.Frame(self.preview_area, style="Panel.TFrame")
         playback.pack(fill=X, pady=(0, 12))
         self.preview_play_button = ttk.Button(playback, text="▶ 再生", command=self.play_preview, state="disabled")
         self.preview_play_button.pack(side=LEFT, fill=X, expand=True, padx=(0, 3))
@@ -522,10 +649,16 @@ class MiniLogApp:
         self.preview_from_cut_button.pack(side=LEFT, fill=X, expand=True, padx=(3, 0))
 
         self.total_duration_var = StringVar(value="動画の長さ：0.0秒")
-        ttk.Label(parent, textvariable=self.total_duration_var, style="Panel.TLabel").pack(anchor="w", pady=(0, 10))
+        ttk.Label(self.preview_area, textvariable=self.total_duration_var, style="Panel.TLabel").pack(anchor="w", pady=(0, 10))
         ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator").pack(
             fill=X, pady=(0, 12)
         )
+        cut_group = ttk.LabelFrame(
+            parent, text="このカット", style="Scope.TLabelframe", padding=(12, 8),
+        )
+        self.cut_scope = cut_group
+        cut_group.pack(fill=X, pady=(0, 12))
+        parent = cut_group
         ttk.Label(parent, text="カットキャプション", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
         cut_caption = ttk.Frame(parent, style="Panel.TFrame")
         cut_caption.pack(fill=X, pady=(0, 8))
@@ -550,7 +683,22 @@ class MiniLogApp:
         self.cut_caption_text.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(12, 0), pady=4)
         self.cut_caption_text.bind("<KeyRelease>", self._on_cut_caption_text_edited)
 
-        ttk.Label(cut_caption, text="位置", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(cut_caption, text="スタイル", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=4)
+        self.cut_caption_style_var = StringVar(value=CAPTION_STYLE_LABELS["band"])
+        self.cut_caption_style_combo = ttk.Combobox(
+            cut_caption,
+            textvariable=self.cut_caption_style_var,
+            values=tuple(CAPTION_STYLE_LABELS.values()),
+            state="readonly",
+            width=12,
+        )
+        self.cut_caption_style_combo.grid(row=1, column=1, sticky="w", padx=(12, 10), pady=4)
+        self.cut_caption_style_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._on_cut_caption_style_edited("caption_style"),
+        )
+
+        ttk.Label(cut_caption, text="位置", style="Panel.TLabel").grid(row=3, column=0, sticky="w", pady=4)
         self.cut_caption_position_var = StringVar(value=CAPTION_POSITION_LABELS["bottom"])
         self.cut_caption_position_combo = ttk.Combobox(
             cut_caption,
@@ -559,12 +707,12 @@ class MiniLogApp:
             state="readonly",
             width=8,
         )
-        self.cut_caption_position_combo.grid(row=1, column=1, sticky="w", padx=(12, 10), pady=4)
+        self.cut_caption_position_combo.grid(row=3, column=1, sticky="w", padx=(12, 10), pady=4)
         self.cut_caption_position_combo.bind(
             "<<ComboboxSelected>>",
             lambda _event: self._on_cut_caption_style_edited("caption_position"),
         )
-        ttk.Label(cut_caption, text="表示", style="Panel.TLabel").grid(row=1, column=2, sticky="w", pady=4)
+        ttk.Label(cut_caption, text="表示", style="Panel.TLabel").grid(row=3, column=2, sticky="w", pady=4)
         self.cut_caption_motion_var = StringVar(value=CAPTION_MOTION_LABELS["fade"])
         self.cut_caption_motion_combo = ttk.Combobox(
             cut_caption,
@@ -573,7 +721,7 @@ class MiniLogApp:
             state="readonly",
             width=12,
         )
-        self.cut_caption_motion_combo.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=4)
+        self.cut_caption_motion_combo.grid(row=3, column=3, sticky="ew", padx=(8, 0), pady=4)
         self.cut_caption_motion_combo.bind(
             "<<ComboboxSelected>>",
             lambda _event: self._on_cut_caption_style_edited("caption_motion"),
@@ -609,9 +757,80 @@ class MiniLogApp:
         )
         cut_caption.columnconfigure(3, weight=1)
 
-        ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator").pack(
-            fill=X, pady=(6, 12)
+        self.transition_separator = ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator")
+        self.transition_separator.pack(fill=X, pady=(6, 12))
+        transition_heading = ttk.Label(parent, text="切り替え", style="Section.TLabel")
+        transition_heading.pack(anchor="w", pady=(0, 5))
+        transition_row = ttk.Frame(parent, style="Panel.TFrame")
+        transition_row.pack(fill=X, pady=(0, 4))
+        ttk.Label(transition_row, text="種類", style="Panel.TLabel").pack(side=LEFT)
+        self.transition_type_var = StringVar(value=TRANSITION_LABELS["cut"])
+        self.transition_type_combo = ttk.Combobox(
+            transition_row,
+            textvariable=self.transition_type_var,
+            values=tuple(TRANSITION_LABELS.values()),
+            state="readonly",
+            width=16,
         )
+        self.transition_type_combo.pack(side=LEFT, padx=(12, 14))
+        self.transition_type_combo.bind("<<ComboboxSelected>>", self._on_transition_type_changed)
+        self.transition_duration_label = ttk.Label(transition_row, text="時間", style="Panel.TLabel")
+        self.transition_duration_label.pack(side=LEFT)
+        self.transition_duration_var = StringVar(value=TRANSITION_DURATION_LABELS[0.4])
+        self.transition_duration_combo = ttk.Combobox(
+            transition_row,
+            textvariable=self.transition_duration_var,
+            values=tuple(TRANSITION_DURATION_VALUES.keys()),
+            state="readonly",
+            width=8,
+        )
+        self.transition_duration_combo.pack(side=LEFT, padx=(12, 0))
+        self.transition_duration_combo.bind("<<ComboboxSelected>>", self._on_transition_duration_changed)
+        self.transition_help_label = ttk.Label(
+            parent,
+            text="このカットから次のカットへの切り替えです（最後のカットでは使いません）",
+            style="PanelMuted.TLabel",
+        )
+        self.transition_help_label.pack(anchor="w", pady=(0, 8))
+
+        self.video_audio_section = ttk.Frame(parent, style="Panel.TFrame")
+        ttk.Label(self.video_audio_section, text="動画音声", style="Section.TLabel").pack(anchor="w", pady=(0, 4))
+        video_audio_row = ttk.Frame(self.video_audio_section, style="Panel.TFrame")
+        video_audio_row.pack(fill=X)
+        self.video_audio_var = BooleanVar(value=True)
+        self.video_audio_check = ttk.Checkbutton(
+            video_audio_row,
+            text="元動画音声を使用",
+            variable=self.video_audio_var,
+            command=self._on_video_audio_toggle,
+        )
+        self.video_audio_check.pack(side=LEFT)
+        self.video_audio_volume_var = DoubleVar(value=100.0)
+        self.video_audio_volume_scale = ttk.Scale(
+            video_audio_row,
+            from_=0,
+            to=100,
+            variable=self.video_audio_volume_var,
+            command=self._on_video_audio_volume_changed,
+        )
+        self.video_audio_volume_scale.pack(side=LEFT, fill=X, expand=True, padx=(10, 8))
+        self.video_audio_volume_label_var = StringVar(value="100%")
+        ttk.Label(
+            video_audio_row,
+            textvariable=self.video_audio_volume_label_var,
+            style="Panel.TLabel",
+            width=5,
+        ).pack(side=RIGHT)
+        self.video_audio_help_var = StringVar(value="")
+        ttk.Label(
+            self.video_audio_section,
+            textvariable=self.video_audio_help_var,
+            style="PanelMuted.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+        self.video_audio_separator = ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator")
+
+        self.cut_audio_separator = ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator")
+        self.cut_audio_separator.pack(fill=X, pady=(6, 12))
         ttk.Label(parent, text="カット音声", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
         cut_audio = ttk.Frame(parent, style="Panel.TFrame")
         cut_audio.pack(fill=X, pady=(0, 8))
@@ -642,6 +861,10 @@ class MiniLogApp:
             state="disabled",
         )
         self.cut_audio_remove_button.grid(row=2, column=1, sticky="w", padx=(7, 0))
+        self.cut_audio_audition_button = ttk.Button(
+            cut_audio, text="▶ 試聴", command=self.toggle_cut_audio_audition, state="disabled",
+        )
+        self.cut_audio_audition_button.grid(row=2, column=2, sticky="w", padx=(7, 0))
         volume_row = ttk.Frame(cut_audio, style="Panel.TFrame")
         volume_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Label(volume_row, text="音量", style="Panel.TLabel").pack(side=LEFT)
@@ -664,25 +887,37 @@ class MiniLogApp:
         ).pack(side=RIGHT)
         cut_audio.columnconfigure(2, weight=1)
 
+        # Keep the transition tied to this Cut, after its audio controls.
+        for widget in (
+            self.transition_separator, transition_heading, transition_row, self.transition_help_label,
+        ):
+            widget.pack_forget()
+        self.transition_separator.pack(fill=X, pady=(6, 12))
+        transition_heading.pack(anchor="w", pady=(0, 5))
+        transition_row.pack(fill=X, pady=(0, 4))
+        self.transition_help_label.pack(anchor="w", pady=(0, 8))
+
+        whole_group.pack(fill=X, pady=(0, 12))
+        parent = whole_group
+
         ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator").pack(
             fill=X, pady=(6, 12)
         )
-        ttk.Label(parent, text="全体設定", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
+        settings_heading = ttk.Label(parent, text="終了キャプション", style="Section.TLabel")
         settings = ttk.Frame(parent, style="Panel.TFrame")
-        settings.pack(fill=X)
-        ttk.Label(settings, text="スタイル", style="Panel.TLabel").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Label(look_settings, text="素材スタイル", style="Panel.TLabel").grid(row=4, column=0, sticky="w", pady=5)
         self.style_var = StringVar(value=STYLE_LABELS["Natural"])
         style_combo = ttk.Combobox(
-            settings,
+            look_settings,
             textvariable=self.style_var,
             values=tuple(STYLE_LABELS.values()),
             state="readonly",
             width=15,
         )
-        style_combo.grid(row=0, column=1, sticky="ew", padx=(14, 0), pady=5)
+        style_combo.grid(row=4, column=1, sticky="ew", padx=(14, 0), pady=5)
         style_combo.bind("<<ComboboxSelected>>", self._on_style_changed)
 
-        ttk.Label(settings, text="終了キャプション", style="Panel.TLabel").grid(row=1, column=0, sticky="nw", pady=5)
+        ttk.Label(settings, text="テキスト", style="Panel.TLabel").grid(row=0, column=0, sticky="nw", pady=5)
         self.caption_text = Text(
             settings,
             height=3,
@@ -700,16 +935,17 @@ class MiniLogApp:
             highlightcolor=self.theme.accent,
         )
         self.raw_text_widgets.append(self.caption_text)
-        self.caption_text.grid(row=1, column=1, sticky="ew", padx=(14, 0), pady=5)
+        self.caption_text.grid(row=0, column=1, sticky="ew", padx=(14, 0), pady=5)
         self.caption_text.bind("<KeyRelease>", self._on_project_settings_edited)
 
-        ttk.Label(settings, text="表示時間", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Label(settings, text="表示時間", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=5)
         self.caption_duration_var = StringVar(value="2.0")
         duration = ttk.Spinbox(settings, from_=0.2, to=60, increment=0.1, textvariable=self.caption_duration_var, width=8)
-        duration.grid(row=2, column=1, sticky="w", padx=(14, 0), pady=5)
+        duration.grid(row=1, column=1, sticky="w", padx=(14, 0), pady=5)
         duration.bind("<FocusOut>", self._on_project_settings_edited)
         duration.bind("<KeyRelease>", self._on_project_settings_edited)
         self.caption_duration_var.trace_add("write", lambda *_args: self._on_project_settings_edited())
+
         settings.columnconfigure(1, weight=1)
 
         ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator").pack(
@@ -730,10 +966,14 @@ class MiniLogApp:
         self.bgm_select_button.grid(row=1, column=0, sticky="w")
         self.bgm_remove_button = ttk.Button(self.bgm_box, text="削除", command=self.remove_bgm, state="disabled")
         self.bgm_remove_button.grid(row=1, column=1, sticky="w", padx=(7, 0))
-        ttk.Label(self.bgm_box, text="音声ファイルをここにドロップ", style="DropZoneMuted.TLabel").grid(
-            row=1, column=2, sticky="e"
+        self.bgm_audition_button = ttk.Button(
+            self.bgm_box, text="▶ 試聴", command=self.toggle_bgm_audition, state="disabled",
         )
-        self.bgm_box.columnconfigure(2, weight=1)
+        self.bgm_audition_button.grid(row=1, column=2, sticky="w", padx=(7, 0))
+        ttk.Label(self.bgm_box, text="音声ファイルをここにドロップ", style="DropZoneMuted.TLabel").grid(
+            row=1, column=3, sticky="e", padx=(10, 0)
+        )
+        self.bgm_box.columnconfigure(3, weight=1)
         volume_row = ttk.Frame(parent, style="Panel.TFrame")
         volume_row.pack(fill=X, pady=(7, 0))
         ttk.Label(volume_row, text="音量", style="Panel.TLabel").pack(side=LEFT)
@@ -750,6 +990,11 @@ class MiniLogApp:
         ttk.Label(volume_row, textvariable=self.bgm_volume_label_var, style="Panel.TLabel", width=5).pack(side=RIGHT)
         for widget in (self.bgm_box, self.bgm_name_label):
             self._register_bgm_drop_target(widget)
+        ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator").pack(
+            fill=X, pady=(12, 12)
+        )
+        settings_heading.pack(anchor="w", pady=(0, 5))
+        settings.pack(fill=X)
 
     def _build_export_panel(self, parent: ttk.Frame) -> None:
         ttk.Separator(parent, orient=HORIZONTAL, style="Strong.Horizontal.TSeparator").pack(
@@ -801,7 +1046,7 @@ class MiniLogApp:
         total = self.project.total_duration()
         self.total_duration_var.set(f"動画の長さ：{total:.1f}秒")
         self.cut_count_label.configure(
-            text=f"{len(self.project.cuts)}カット / {sum(cut.duration for cut in self.project.cuts):.1f}秒"
+            text=f"{len(self.project.cuts)}カット / {sum(cut.effective_duration() for cut in self.project.cuts):.1f}秒"
         )
         if position is not None:
             playback_total = self.player.duration if self.player.playing else total
@@ -825,6 +1070,68 @@ class MiniLogApp:
             self.preview_state_var.set("プレビューはまだありません")
             self.preview_create_button.configure(text="プレビューを作成")
 
+    def _refresh_transition_display(self) -> None:
+        cut = self._active_cut()
+        if cut is None:
+            self.transition_type_var.set(TRANSITION_LABELS["cut"])
+            self.transition_duration_var.set(TRANSITION_DURATION_LABELS[0.4])
+            self.transition_type_combo.configure(state="disabled")
+            self.transition_duration_combo.configure(state="disabled")
+            self._show_transition_duration(False)
+            self.transition_help_label.configure(
+                text="このカットから次のカットへの切り替えです（最後のカットでは使いません）"
+            )
+            return
+
+        self.transition_type_var.set(TRANSITION_LABELS.get(cut.transition_type, TRANSITION_LABELS["cut"]))
+        duration = min(TRANSITION_DURATION_LABELS, key=lambda value: abs(value - cut.transition_duration))
+        self.transition_duration_var.set(TRANSITION_DURATION_LABELS[duration])
+        is_last = self.selected_index == len(self.project.cuts) - 1
+        self.transition_type_combo.configure(state="disabled" if is_last else "readonly")
+        self.transition_duration_combo.configure(
+            state="readonly" if not is_last and cut.transition_type != "cut" else "disabled"
+        )
+        self._show_transition_duration(not is_last and cut.transition_type != "cut")
+        if is_last:
+            self.transition_help_label.configure(text="最後のカットなので、切り替え設定は使いません")
+        else:
+            self.transition_help_label.configure(
+                text="このカットから次のカットへの切り替えです"
+            )
+
+    def _show_transition_duration(self, show: bool) -> None:
+        if show:
+            if not self.transition_duration_label.winfo_manager():
+                self.transition_duration_label.pack(side=LEFT)
+            if not self.transition_duration_combo.winfo_manager():
+                self.transition_duration_combo.pack(side=LEFT, padx=(12, 0))
+        else:
+            self.transition_duration_label.pack_forget()
+            self.transition_duration_combo.pack_forget()
+
+    def _on_transition_type_changed(self, _event=None) -> None:
+        cut = self._active_cut()
+        if cut is None or self.selected_index == len(self.project.cuts) - 1:
+            return
+        transition_type = TRANSITION_VALUES.get(self.transition_type_var.get(), "cut")
+        if cut.transition_type == transition_type:
+            return
+        cut.transition_type = transition_type
+        self._refresh_transition_display()
+        self._mark_preview_stale()
+        self.status_var.set(f"カット {self.selected_index + 1:02d} の切り替えを変更しました")
+
+    def _on_transition_duration_changed(self, _event=None) -> None:
+        cut = self._active_cut()
+        if cut is None or cut.transition_type == "cut" or self.selected_index == len(self.project.cuts) - 1:
+            return
+        duration = TRANSITION_DURATION_VALUES.get(self.transition_duration_var.get(), 0.4)
+        if abs(cut.transition_duration - duration) < 0.0001:
+            return
+        cut.transition_duration = duration
+        self._mark_preview_stale()
+        self.status_var.set(f"カット {self.selected_index + 1:02d} の切り替え時間を変更しました")
+
     def _on_project_settings_edited(self, _event=None) -> None:
         if self._suspend_dirty:
             return
@@ -832,7 +1139,9 @@ class MiniLogApp:
         self._mark_preview_stale()
 
     def _load_selected_cut_caption(self) -> None:
+        self._refresh_video_audio_display()
         self._refresh_cut_audio_display()
+        self._refresh_transition_display()
         self._suspend_cut_caption = True
         try:
             self.cut_caption_text.configure(state="normal")
@@ -842,11 +1151,13 @@ class MiniLogApp:
                 self.cut_caption_motion_var.set(CAPTION_MOTION_LABELS["fade"])
                 self.cut_caption_font_var.set(CAPTION_FONT_LABELS["gothic"])
                 self.cut_caption_size_var.set(CAPTION_SIZE_LABELS["medium"])
+                self.cut_caption_style_var.set(CAPTION_STYLE_LABELS["band"])
                 self.cut_caption_text.configure(state="disabled")
                 self.cut_caption_position_combo.configure(state="disabled")
                 self.cut_caption_motion_combo.configure(state="disabled")
                 self.cut_caption_font_combo.configure(state="disabled")
                 self.cut_caption_size_combo.configure(state="disabled")
+                self.cut_caption_style_combo.configure(state="disabled")
                 return
             cut = self.project.cuts[self.selected_index]
             self.cut_caption_text.insert("1.0", cut.caption_text)
@@ -862,10 +1173,14 @@ class MiniLogApp:
             self.cut_caption_size_var.set(
                 CAPTION_SIZE_LABELS.get(cut.caption_size, CAPTION_SIZE_LABELS["medium"])
             )
+            self.cut_caption_style_var.set(
+                CAPTION_STYLE_LABELS.get(cut.caption_style, CAPTION_STYLE_LABELS["band"])
+            )
             self.cut_caption_position_combo.configure(state="readonly")
             self.cut_caption_motion_combo.configure(state="readonly")
             self.cut_caption_font_combo.configure(state="readonly")
             self.cut_caption_size_combo.configure(state="readonly")
+            self.cut_caption_style_combo.configure(state="readonly")
         finally:
             self._suspend_cut_caption = False
 
@@ -905,6 +1220,9 @@ class MiniLogApp:
             "caption_size": CAPTION_SIZE_VALUES.get(
                 self.cut_caption_size_var.get(), "medium"
             ),
+            "caption_style": CAPTION_STYLE_VALUES.get(
+                self.cut_caption_style_var.get(), "band"
+            ),
         }
         if field not in values:
             return
@@ -923,13 +1241,14 @@ class MiniLogApp:
                 "caption_motion": "表示",
                 "caption_font": "フォント",
                 "caption_size": "文字サイズ",
+                "caption_style": "スタイル",
             }
             self.status_var.set(f"{len(targets)}カットのCaption {labels[field]}を変更しました")
 
     def _on_cut_caption_edited(self, _event=None) -> None:
         """Compatibility helper for tests and callers that update all Caption controls."""
         self._on_cut_caption_text_edited(_event)
-        for field in ("caption_position", "caption_motion", "caption_font", "caption_size"):
+        for field in ("caption_position", "caption_motion", "caption_font", "caption_size", "caption_style"):
             self._on_cut_caption_style_edited(field, _event)
 
     def _active_cut(self) -> Cut | None:
@@ -937,14 +1256,74 @@ class MiniLogApp:
             return None
         return self.project.cuts[self.selected_index]
 
+    def _refresh_video_audio_display(self) -> None:
+        cut = self._active_cut()
+        if cut is None or cut.type != "Video":
+            self.video_audio_section.pack_forget()
+            self.video_audio_separator.pack_forget()
+            return
+        self.video_audio_separator.pack(fill=X, pady=(6, 12), before=self.transition_separator)
+        self.video_audio_section.pack(fill=X, pady=(0, 8), before=self.transition_separator)
+        self._suspend_video_audio = True
+        try:
+            self.video_audio_var.set(bool(cut.use_source_audio))
+            percent = max(0, min(round(cut.source_audio_volume * 100), 100))
+            self.video_audio_volume_var.set(percent)
+            self.video_audio_volume_label_var.set(f"{percent}%")
+            if cut.source_has_audio:
+                self.video_audio_check.configure(state="normal")
+                self.video_audio_help_var.set("元動画の音声をBGM・カット音声と一緒に再生します")
+                self.video_audio_volume_scale.configure(state="normal" if cut.use_source_audio else "disabled")
+            else:
+                self.video_audio_check.configure(state="disabled")
+                self.video_audio_volume_scale.configure(state="disabled")
+                self.video_audio_help_var.set("この動画には音声トラックがありません")
+        finally:
+            self._suspend_video_audio = False
+
+    def _on_video_audio_toggle(self) -> None:
+        if self._suspend_video_audio:
+            return
+        cut = self._active_cut()
+        if cut is None or cut.type != "Video" or not cut.source_has_audio:
+            return
+        enabled = bool(self.video_audio_var.get())
+        if cut.use_source_audio != enabled:
+            cut.use_source_audio = enabled
+            self.video_audio_volume_scale.configure(state="normal" if enabled else "disabled")
+            self._mark_preview_stale()
+            self.status_var.set("元動画音声を使用します" if enabled else "元動画音声をミュートしました")
+
+    def _on_video_audio_volume_changed(self, value=None) -> None:
+        if self._suspend_video_audio:
+            return
+        cut = self._active_cut()
+        if cut is None or cut.type != "Video":
+            return
+        try:
+            percent = max(0, min(round(float(value if value is not None else self.video_audio_volume_var.get())), 100))
+        except (TypeError, ValueError):
+            return
+        self.video_audio_volume_label_var.set(f"{percent}%")
+        volume = percent / 100
+        if abs(cut.source_audio_volume - volume) > 0.0001:
+            cut.source_audio_volume = volume
+            self._mark_preview_stale()
+
     def _refresh_cut_audio_display(self) -> None:
         cut = self._active_cut()
+        if self.audio_audition.kind == "cut" and (
+            cut is None or self.audio_audition.owner_id != cut.id
+            or self.audio_audition.source_path != cut.audio_path
+        ):
+            self.audio_audition.stop()
         self._suspend_cut_audio = True
         try:
             if cut is None:
                 self.cut_audio_name_var.set("カットを選択してください")
                 self.cut_audio_select_button.configure(text="音声を選択", state="disabled")
                 self.cut_audio_remove_button.configure(state="disabled")
+                self.cut_audio_audition_button.configure(state="disabled")
                 self.cut_audio_volume_scale.configure(state="disabled")
                 self.cut_audio_volume_var.set(60.0)
                 self.cut_audio_volume_label_var.set("60%")
@@ -959,6 +1338,7 @@ class MiniLogApp:
                     self.cut_audio_name_var.set(path.name)
                 else:
                     self.cut_audio_name_var.set(f"{path.name}（カット音声ファイルが見つかりません）")
+                self.cut_audio_audition_button.configure(state="normal" if path.is_file() else "disabled")
                 self.cut_audio_select_button.configure(text="変更")
                 self.cut_audio_remove_button.configure(state="normal")
                 self.cut_audio_volume_scale.configure(state="normal")
@@ -966,6 +1346,7 @@ class MiniLogApp:
                 self.cut_audio_name_var.set("未設定")
                 self.cut_audio_select_button.configure(text="音声を選択")
                 self.cut_audio_remove_button.configure(state="disabled")
+                self.cut_audio_audition_button.configure(state="disabled")
                 self.cut_audio_volume_scale.configure(state="disabled")
         finally:
             self._suspend_cut_audio = False
@@ -993,6 +1374,7 @@ class MiniLogApp:
                 "WAV / MP3 / M4A / AACファイルを選択してください。",
             )
             return
+        self.audio_audition.stop()
         cut.audio_path = str(path.resolve())
         self._refresh_cut_audio_display()
         self._mark_preview_stale()
@@ -1002,6 +1384,7 @@ class MiniLogApp:
         cut = self._active_cut()
         if cut is None or not cut.audio_path:
             return
+        self.audio_audition.stop()
         cut.audio_path = None
         self._refresh_cut_audio_display()
         self._mark_preview_stale()
@@ -1035,10 +1418,17 @@ class MiniLogApp:
             paths = list(self.root.tk.splitlist(event.data))
         except Exception:
             paths = [event.data]
-        if paths and all(Path(path).suffix.lower() in SUPPORTED_AUDIO_SUFFIXES for path in paths):
+        media_paths = [
+            path
+            for path in paths
+            if Path(path).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES | SUPPORTED_VIDEO_SUFFIXES
+        ]
+        if not media_paths and paths and all(Path(path).suffix.lower() in SUPPORTED_AUDIO_SUFFIXES for path in paths):
             self.status_var.set("音声ファイルは右側のBGM欄へドロップしてください")
+        elif media_paths:
+            self._add_material_paths(media_paths, source="ドロップ")
         else:
-            self._add_image_paths(paths, source="ドロップ")
+            self.status_var.set("画像またはMP4 / MOVをドロップしてください")
         return getattr(event, "action", None)
 
     def _register_bgm_drop_target(self, widget) -> None:
@@ -1079,6 +1469,7 @@ class MiniLogApp:
         if path.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES or not path.is_file():
             messagebox.showerror("BGMを設定できません", "MP3 / WAV / M4A / AACファイルを選択してください。")
             return
+        self.audio_audition.stop()
         self.project.bgm_path = str(path.resolve())
         self._refresh_bgm_display()
         self._mark_preview_stale()
@@ -1087,22 +1478,27 @@ class MiniLogApp:
     def remove_bgm(self) -> None:
         if not self.project.bgm_path:
             return
+        self.audio_audition.stop()
         self.project.bgm_path = None
         self._refresh_bgm_display()
         self._mark_preview_stale()
         self.status_var.set("BGMを削除しました")
 
     def _refresh_bgm_display(self) -> None:
+        if self.audio_audition.kind == "bgm" and self.audio_audition.source_path != self.project.bgm_path:
+            self.audio_audition.stop()
         if not self.project.bgm_path:
             self.bgm_name_var.set("未設定")
             self.bgm_select_button.configure(text="ファイルを選択")
             self.bgm_remove_button.configure(state="disabled")
+            self.bgm_audition_button.configure(state="disabled")
             return
         path = Path(self.project.bgm_path)
         if path.is_file():
             self.bgm_name_var.set(path.name)
         else:
             self.bgm_name_var.set(f"{path.name}\nBGMファイルが見つかりません")
+        self.bgm_audition_button.configure(state="normal" if path.is_file() else "disabled")
         self.bgm_select_button.configure(text="変更")
         self.bgm_remove_button.configure(state="normal")
 
@@ -1119,27 +1515,77 @@ class MiniLogApp:
             self.project.bgm_volume = volume
             self._mark_preview_stale()
 
-    def _add_image_paths(self, paths, source: str = "選択") -> int:
-        first_new_index = len(self.project.cuts)
-        count = self.project.add_images(paths)
+    def _on_audition_state(self, kind: str | None) -> None:
+        self.bgm_audition_button.configure(text="■ 停止" if kind == "bgm" else "▶ 試聴")
+        self.cut_audio_audition_button.configure(text="■ 停止" if kind == "cut" else "▶ 試聴")
+
+    def toggle_bgm_audition(self) -> None:
+        if self.audio_audition.kind == "bgm":
+            self.audio_audition.stop()
+            return
+        path = self.project.bgm_path
+        if path and Path(path).is_file():
+            if self.player.playing:
+                self.stop_preview()
+            self.audio_audition.play("bgm", path, self.project.bgm_volume)
+
+    def toggle_cut_audio_audition(self) -> None:
+        cut = self._active_cut()
+        if self.audio_audition.kind == "cut":
+            self.audio_audition.stop()
+            return
+        if cut is not None and cut.audio_path and Path(cut.audio_path).is_file():
+            if self.player.playing:
+                self.stop_preview()
+            self.audio_audition.play("cut", cut.audio_path, cut.audio_volume, owner_id=cut.id)
+
+    def _add_material_paths(self, paths, source: str = "選択") -> int:
+        first_new_index = self.selected_index + 1 if self._active_cut() is not None else len(self.project.cuts)
+        added_images, added_videos, errors = self.project.add_materials(
+            paths, probe_video, probe_video_dimensions, insert_index=first_new_index
+        )
+        count = added_images + added_videos
         if count:
             self.selected_index = first_new_index
             self.selected_cut_ids = {self.project.cuts[first_new_index].id}
-            self.status_var.set(f"{source}した画像を{count}枚追加しました")
+            parts = []
+            if added_images:
+                parts.append(f"画像{added_images}枚")
+            if added_videos:
+                parts.append(f"動画{added_videos}本")
+            message = f"{source}した素材を追加しました: " + " / ".join(parts)
+            if errors:
+                message += f"（読み込めない動画 {len(errors)}本をスキップ）"
+            self.status_var.set(message)
             self._mark_preview_stale()
             self._refresh_all()
+        elif errors:
+            messagebox.showerror("動画を追加できません", "\n".join(errors[:5]))
         else:
-            self.status_var.set("追加できる新しい画像はありませんでした")
+            self.status_var.set("追加できる新しい画像 / 動画はありませんでした")
         return count
 
-    def add_images(self) -> None:
+    def _add_image_paths(self, paths, source: str = "選択") -> int:
+        image_paths = [path for path in paths if Path(path).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES]
+        return self._add_material_paths(image_paths, source)
+
+    def add_materials(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="画像を追加",
-            filetypes=[("画像", "*.jpg *.jpeg *.png *.webp"), ("すべてのファイル", "*.*")],
+            title="画像 / 動画を追加",
+            filetypes=[
+                ("画像と動画", "*.jpg *.jpeg *.png *.webp *.mp4 *.mov"),
+                ("画像", "*.jpg *.jpeg *.png *.webp"),
+                ("動画", "*.mp4 *.mov"),
+                ("すべてのファイル", "*.*"),
+            ],
         )
         if not paths:
             return
-        self._add_image_paths(paths)
+        self._add_material_paths(paths)
+
+    def add_images(self) -> None:
+        """Keep the old callback name for existing UI and automation callers."""
+        self.add_materials()
 
     @staticmethod
     def _apply_preview_style(image: Image.Image, style: str) -> Image.Image:
@@ -1172,35 +1618,90 @@ class MiniLogApp:
         style: str | None = None,
         cut: Cut | None = None,
     ) -> ImageTk.PhotoImage:
-        with Image.open(path) as image:
+        if cut is not None and cut.type == "Video":
+            source = self._load_video_frame(path)
+            image = source.copy()
+        else:
+            with Image.open(path) as opened:
+                image = opened.convert("RGB")
+        image = image.convert("RGB")
+        target_ratio = size[0] / size[1]
+        source_ratio = image.width / image.height
+        if source_ratio > target_ratio:
+            crop_width = int(image.height * target_ratio)
+            left = (image.width - crop_width) // 2
+            image = image.crop((left, 0, left + crop_width, image.height))
+        else:
+            crop_height = int(image.width / target_ratio)
+            top = (image.height - crop_height) // 2
+            image = image.crop((0, top, image.width, top + crop_height))
+        image.thumbnail(size, Image.Resampling.LANCZOS)
+        if style:
+            image = self._apply_preview_style(image, style)
+            if self.project.look_strength > 0:
+                cube = None
+                if self.project.look_type in PRESET_IDS:
+                    cube = preset_lut(self.project.look_type)
+                elif (
+                    self.project.look_type == "custom_lut"
+                    and self.project.look_lut_path
+                    and Path(self.project.look_lut_path).is_file()
+                ):
+                    cube = validate_cube(self.project.look_lut_path)
+                if cube is not None:
+                    image = apply_still_look(image, cube, self.project.look_strength)
+        if cut is not None and cut.caption_text.strip():
+            image = image.convert("RGBA")
+            panel = build_cut_caption_panel(
+                cut.caption_text,
+                image.width,
+                image.height,
+                cut.caption_font,
+                cut.caption_size,
+                cut.caption_style,
+            )
+            x = (image.width - panel.width) // 2
+            y = cut_caption_y(cut.caption_position, image.height, panel.height)
+            image.alpha_composite(panel, (x, y))
             image = image.convert("RGB")
-            target_ratio = size[0] / size[1]
-            source_ratio = image.width / image.height
-            if source_ratio > target_ratio:
-                crop_width = int(image.height * target_ratio)
-                left = (image.width - crop_width) // 2
-                image = image.crop((left, 0, left + crop_width, image.height))
-            else:
-                crop_height = int(image.width / target_ratio)
-                top = (image.height - crop_height) // 2
-                image = image.crop((0, top, image.width, top + crop_height))
-            image.thumbnail(size, Image.Resampling.LANCZOS)
-            if style:
-                image = self._apply_preview_style(image, style)
-            if cut is not None and cut.caption_text.strip():
-                image = image.convert("RGBA")
-                panel = build_cut_caption_panel(
-                    cut.caption_text,
-                    image.width,
-                    image.height,
-                    cut.caption_font,
-                    cut.caption_size,
-                )
-                x = (image.width - panel.width) // 2
-                y = cut_caption_y(cut.caption_position, image.height, panel.height)
-                image.alpha_composite(panel, (x, y))
-                image = image.convert("RGB")
-            return ImageTk.PhotoImage(image)
+        return ImageTk.PhotoImage(image)
+
+    def _load_video_frame(self, path: str) -> Image.Image:
+        media = Path(path)
+        stat = media.stat()
+        cache_key = f"{media.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
+        cached = self.video_preview_frame_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result = subprocess.run(
+            [
+                find_ffmpeg(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(media),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=720:720:force_original_aspect_ratio=decrease",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0 or not result.stdout:
+            detail = result.stderr.decode("utf-8", errors="replace")[-500:]
+            raise ExportError(f"動画の先頭フレームを読み込めません: {detail}")
+        with Image.open(io.BytesIO(result.stdout)) as opened:
+            image = opened.convert("RGB")
+        self.video_preview_frame_cache[cache_key] = image.copy()
+        return image
 
     def _refresh_all(self) -> None:
         self._normalize_cut_selection()
@@ -1218,6 +1719,7 @@ class MiniLogApp:
             self.caption_duration_var.set(f"{self.project.caption_duration:.1f}")
             self.bgm_volume_var.set(self.project.bgm_volume * 100)
             self.bgm_volume_label_var.set(f"{round(self.project.bgm_volume * 100)}%")
+            self._refresh_look_display()
         finally:
             self._suspend_dirty = False
         self._refresh_bgm_display()
@@ -1226,7 +1728,12 @@ class MiniLogApp:
         self._refresh_preview()
         self._update_duration_display()
 
-    def _refresh_cut_list(self) -> None:
+    def _refresh_cut_list(self, commit_pending: bool = True) -> None:
+        focused = self.root.focus_get()
+        if commit_pending and focused in self.card_duration_entries:
+            index = self.card_duration_entries.index(focused)
+            self.card_duration_committers[index]()
+        self._rebuilding_cut_list = True
         for child in self.cut_list.winfo_children():
             child.destroy()
         self.cut_photos.clear()
@@ -1235,11 +1742,13 @@ class MiniLogApp:
         self.card_motion_combos.clear()
         self.card_selection_bars.clear()
         self.card_duration_entries.clear()
+        self.card_duration_vars.clear()
         self.card_duration_minus_buttons.clear()
         self.card_duration_plus_buttons.clear()
         self.card_duration_frames.clear()
+        self.card_duration_committers.clear()
         self.cut_count_label.configure(
-            text=f"{len(self.project.cuts)}カット / {sum(cut.duration for cut in self.project.cuts):.1f}秒"
+            text=f"{len(self.project.cuts)}カット / {sum(cut.effective_duration() for cut in self.project.cuts):.1f}秒"
         )
 
         if not self.project.cuts:
@@ -1247,17 +1756,19 @@ class MiniLogApp:
             empty.pack(fill=BOTH, expand=True, padx=3, pady=3)
             ttk.Label(
                 empty,
-                text="画像をここにドロップ",
+                text="画像 / 動画をここにドロップ",
                 font=("Yu Gothic UI", 15, "bold"),
                 style="DropZone.TLabel",
             ).pack()
             ttk.Label(empty, text="または", style="DropZoneMuted.TLabel").pack(pady=(8, 4))
-            ttk.Button(empty, text="画像を選択", command=self.add_images).pack()
+            ttk.Button(empty, text="画像 / 動画を選択", command=self.add_materials).pack()
             self._register_drop_target(empty)
+            self._rebuilding_cut_list = False
             return
 
         for index, cut in enumerate(self.project.cuts):
             self._build_cut_card(index, cut)
+        self._rebuilding_cut_list = False
 
     def _build_cut_card(self, index: int, cut: Cut) -> None:
         selected = cut.id in self.selected_cut_ids
@@ -1290,12 +1801,16 @@ class MiniLogApp:
         handle.grid(row=0, column=0, rowspan=4, sticky="ns", padx=(0, 3))
         number = ttk.Label(inner, text=f"{index + 1:02d}", width=3, style=label_style)
         number.grid(row=0, column=1, rowspan=4, sticky="n", padx=(0, 5))
-        try:
-            photo = self._make_thumbnail(cut.source_path, (68, 88))
-            self.cut_photos.append(photo)
-            thumb = ttk.Label(inner, image=photo, style=label_style)
-        except Exception:
-            thumb = ttk.Label(inner, text="画像なし", width=9, style=muted_style)
+        if cut.type == "Video":
+            # Phase 2A intentionally avoids generating per-card video thumbnails.
+            thumb = ttk.Label(inner, text="▶\n動画", width=9, style=muted_style, justify="center")
+        else:
+            try:
+                photo = self._make_thumbnail(cut.source_path, (68, 88), cut=cut)
+                self.cut_photos.append(photo)
+                thumb = ttk.Label(inner, image=photo, style=label_style)
+            except Exception:
+                thumb = ttk.Label(inner, text="画像なし", width=9, style=muted_style)
         thumb.grid(row=0, column=2, rowspan=4, padx=(0, 12))
 
         type_label = ttk.Label(inner, text="種類", style=muted_style)
@@ -1303,12 +1818,14 @@ class MiniLogApp:
         type_var = StringVar(value=CUT_TYPE_LABELS.get(cut.type, CUT_TYPE_LABELS["Still"]))
         type_combo = ttk.Combobox(
             inner,
-            values=tuple(CUT_TYPE_LABELS.values()),
+            values=(CUT_TYPE_LABELS["Video"],) if cut.type == "Video" else (CUT_TYPE_LABELS["Still"], CUT_TYPE_LABELS["Motion"]),
             textvariable=type_var,
             state="readonly",
             width=10,
         )
         type_combo.grid(row=0, column=4, sticky="w", pady=2)
+        if cut.type == "Video":
+            type_combo.configure(state="disabled")
 
         duration_label = ttk.Label(inner, text="表示時間", style=muted_style)
         duration_label.grid(row=1, column=3, sticky="w", padx=(0, 5))
@@ -1346,7 +1863,21 @@ class MiniLogApp:
             command=lambda: adjust_duration(DURATION_STEP),
         )
         duration_plus.pack(side=LEFT)
+        if cut.type == "Video" and cut.media_duration is not None:
+            source_duration = cut.media_duration
+            ttk.Button(
+                duration_controls,
+                text="元動画長",
+                width=7,
+                command=lambda d=source_duration: set_duration(d),
+            ).pack(side=LEFT, padx=(7, 0))
+            ttk.Label(
+                duration_controls,
+                text=f"素材 {cut.media_duration:.1f}秒",
+                style=muted_style,
+            ).pack(side=LEFT, padx=(5, 0))
         self.card_duration_entries.append(duration_entry)
+        self.card_duration_vars.append(duration_var)
         self.card_duration_minus_buttons.append(duration_minus)
         self.card_duration_plus_buttons.append(duration_plus)
 
@@ -1356,19 +1887,19 @@ class MiniLogApp:
             value=(
                 MOTION_TYPE_LABELS.get(cut.motion_type, MOTION_TYPE_LABELS["Zoom In"])
                 if cut.type == "Motion"
-                else NO_MOTION_LABEL
+                else VIDEO_NO_MOTION_LABEL if cut.type == "Video" else NO_MOTION_LABEL
             )
         )
         motion_combo = ttk.Combobox(
             inner,
-            values=tuple(MOTION_TYPE_LABELS.values()) if cut.type == "Motion" else (NO_MOTION_LABEL,),
+            values=tuple(MOTION_TYPE_LABELS.values()) if cut.type == "Motion" else (VIDEO_NO_MOTION_LABEL,) if cut.type == "Video" else (NO_MOTION_LABEL,),
             textvariable=motion_var,
             state="readonly",
             width=21,
         )
         motion_combo.grid(row=2, column=4, columnspan=2, sticky="w", pady=2)
         self.card_motion_combos.append(motion_combo)
-        if cut.type == "Still":
+        if cut.type != "Motion":
             motion_combo.configure(state="disabled")
 
         ttk.Button(inner, text="削除", width=5, command=lambda i=index: self.remove_cut(i)).grid(
@@ -1388,7 +1919,10 @@ class MiniLogApp:
                 cut.motion_type = MOTION_TYPE_VALUES.get(motion_var.get(), cut.motion_type)
             if cut.type != previous_type:
                 cut.duration = 3.0 if cut.type == "Motion" else 1.5
-                self._refresh_cut_list()
+                if cut.type == "Video" and cut.media_duration is not None:
+                    cut.duration = cut.media_duration
+                cut.normalize()
+                self._refresh_cut_list(commit_pending=False)
             self.selected_index = index
             self.selected_cut_ids.add(cut.id)
             if before != (cut.type, cut.duration, cut.motion_type):
@@ -1397,34 +1931,64 @@ class MiniLogApp:
             self._refresh_preview()
 
         def commit_duration(_event=None):
+            if self._rebuilding_cut_list or not duration_entry.winfo_exists():
+                return None
             try:
-                value = clamp_cut_duration(float(duration_var.get()))
+                raw_value = float(duration_var.get())
+                if not math.isfinite(raw_value):
+                    raise ValueError
+                requested = clamp_cut_duration(raw_value, is_video=True)
             except ValueError:
                 duration_var.set(f"{cut.duration:.1f}")
                 return "break"
-            duration_var.set(f"{value:.1f}")
-            if abs(cut.duration - value) > 0.0001:
-                cut.duration = value
-                self.selected_index = index
-                self.selected_cut_ids.add(cut.id)
+            targets = (
+                [item for item in self.project.cuts if item.id in self.selected_cut_ids]
+                if len(self.selected_cut_ids) > 1 and cut.id in self.selected_cut_ids
+                else [cut]
+            )
+            changed = False
+            for target in targets:
+                target_value = clamp_cut_duration(
+                    requested,
+                    target.media_duration if target.type == "Video" else None,
+                    is_video=target.type == "Video",
+                )
+                if abs(target.duration - target_value) > 0.0001:
+                    target.duration = target_value
+                    changed = True
+            for target_index, item in enumerate(self.project.cuts):
+                if item in targets and target_index < len(self.card_duration_vars):
+                    self.card_duration_vars[target_index].set(f"{item.duration:.1f}")
+            if changed:
                 self._mark_preview_stale()
-                self._load_selected_cut_caption()
-                self._refresh_preview()
-                self.status_var.set(f"カット {index + 1:02d} の表示時間を {value:.1f}秒に変更しました")
+                self._refresh_preview_meta()
+                self.status_var.set(
+                    f"{len(targets)}カットの表示時間を{requested:.1f}秒に変更しました"
+                    + ("（動画は素材尺まで）" if any(item.duration < requested for item in targets) else "")
+                    if len(targets) > 1
+                    else f"カット {index + 1:02d} の表示時間を {cut.duration:.1f}秒に変更しました"
+                )
             return "break" if _event is not None and getattr(_event, "keysym", "") == "Return" else None
+
+        def set_duration(value: float) -> None:
+            duration_var.set(f"{value:.1f}")
+            commit_duration()
 
         def adjust_duration(delta: float) -> None:
             try:
                 base = float(duration_var.get())
+                if not math.isfinite(base):
+                    raise ValueError
             except ValueError:
                 base = cut.duration
-            duration_var.set(f"{clamp_cut_duration(base + delta):.1f}")
+            duration_var.set(f"{clamp_cut_duration(base + delta, cut.media_duration, is_video=cut.type == 'Video'):.1f}")
             commit_duration()
 
         type_combo.bind("<<ComboboxSelected>>", update_cut)
         motion_combo.bind("<<ComboboxSelected>>", update_cut)
         duration_entry.bind("<FocusOut>", commit_duration)
         duration_entry.bind("<Return>", commit_duration)
+        self.card_duration_committers.append(commit_duration)
         drag_widgets = (
             card,
             selection_bar,
@@ -1652,24 +2216,46 @@ class MiniLogApp:
         self._request_cut_deletion(set(self.selected_cut_ids))
         return "break"
 
+    def _on_select_all_cuts(self, _event=None):
+        if self._is_text_editing_widget(self.root.focus_get()) or not self.project.cuts:
+            return None
+        self.selected_cut_ids = {cut.id for cut in self.project.cuts}
+        if self.selected_index is None:
+            self.selected_index = 0
+        self._refresh_cut_list()
+        self.status_var.set(f"{len(self.selected_cut_ids)}カットを選択しました")
+        return "break"
+
+    def _preview_display_size(self, project: Project | None = None) -> tuple[int, int]:
+        width, height = (project or self.project).output_dimensions()
+        scale = min(320 / width, 320 / height)
+        return max(2, round(width * scale)), max(2, round(height * scale))
+
     def _refresh_preview(self) -> None:
         if self.selected_index is None or not (0 <= self.selected_index < len(self.project.cuts)):
             self.preview_photo = None
-            self.preview_label.configure(image="", text="カットを選ぶとここに表示されます\n画像のドロップでも追加できます")
+            self.preview_label.configure(image="", text="カットを選ぶとここに表示されます\n画像 / 動画のドロップでも追加できます")
             self.preview_meta.configure(text="")
             return
         cut = self.project.cuts[self.selected_index]
         try:
-            photo = self._make_thumbnail(cut.source_path, (180, 320), style=self.project.style, cut=cut)
+            photo = self._make_thumbnail(cut.source_path, self._preview_display_size(), style=self.project.style, cut=cut)
             self.preview_photo = photo
             self.preview_label.configure(image=photo, text="")
         except Exception as exc:
             self.preview_photo = None
-            self.preview_label.configure(image="", text=f"画像を表示できません\n{exc}")
+            self.preview_label.configure(image="", text=f"素材を表示できません\n{exc}")
+        self._refresh_preview_meta()
+
+    def _refresh_preview_meta(self) -> None:
+        if self.selected_index is None or not (0 <= self.selected_index < len(self.project.cuts)):
+            return
+        cut = self.project.cuts[self.selected_index]
         type_label = CUT_TYPE_LABELS.get(cut.type, cut.type)
         motion = f" · {MOTION_TYPE_LABELS.get(cut.motion_type, cut.motion_type)}" if cut.type == "Motion" else ""
         style = STYLE_LABELS.get(self.project.style, self.project.style)
-        self.preview_meta.configure(text=f"{type_label}{motion} · {cut.duration:.1f}秒 · {style}")
+        duration = cut.effective_duration()
+        self.preview_meta.configure(text=f"{type_label}{motion} · {duration:.1f}秒 · {style}")
 
     def _on_style_changed(self, _event=None) -> None:
         self._sync_project_settings()
@@ -1677,9 +2263,145 @@ class MiniLogApp:
         self._refresh_preview()
         self.status_var.set(f"スタイルを「{self.style_var.get()}」に変更しました")
 
+    def _refresh_look_display(self) -> None:
+        if self.project.look_type not in {"original", "custom_lut"} | PRESET_IDS:
+            self._look_warning = "LOOKプリセットが見つかりません"
+            self.project.look_type = "original"
+            self.project.look_strength = 1.0
+        if self.project.look_type == "custom_lut" and not self.project.look_lut_path:
+            self._look_warning = "LUTファイルが見つかりません"
+            self.project.look_type = "original"
+            self.project.look_strength = 1.0
+            self._loaded_look_lut_path = None
+        if self.project.look_type == "custom_lut" and self.project.look_lut_path:
+            try:
+                validate_cube(self.project.look_lut_path)
+            except LookError as exc:
+                self.preview_logger.warning("LOOK LUT unavailable: %s", exc)
+                self._look_warning = (
+                    "LUTファイルが見つかりません"
+                    if not Path(self.project.look_lut_path).is_file()
+                    else "このLUTを読み込めませんでした"
+                )
+                self.project.look_type = "original"
+                self.project.look_lut_path = None
+                self.project.look_strength = 1.0
+                self._loaded_look_lut_path = None
+            else:
+                self._loaded_look_lut_path = self.project.look_lut_path
+                self._loaded_look_strength = self.project.look_strength
+
+        active = self.project.look_type in PRESET_IDS or self.project.look_type == "custom_lut"
+        if self.project.look_type in PRESET_IDS:
+            self.look_mode_var.set(preset_label(self.project.look_type))
+            self._preset_strengths[self.project.look_type] = self.project.look_strength
+        else:
+            self.look_mode_var.set("カスタムLUT" if self.project.look_type == "custom_lut" else "オリジナル")
+        self.look_name_var.set(
+            self._look_warning
+            or (Path(self._loaded_look_lut_path).name if self._loaded_look_lut_path else "未設定")
+        )
+        if self.project.look_type == "custom_lut" or self._look_warning:
+            self.look_name_label.grid()
+        else:
+            self.look_name_label.grid_remove()
+        if self.project.look_type == "custom_lut":
+            self.look_lut_button.grid()
+        else:
+            self.look_lut_button.grid_remove()
+        strength = self.project.look_strength if active else 1.0
+        self.look_strength_var.set(strength * 100)
+        self.look_strength_label_var.set(f"{round(strength * 100)}%")
+        self.look_strength_scale.configure(state="normal" if active else "disabled")
+
+    def _on_look_mode_changed(self, _event=None) -> None:
+        if self._suspend_dirty:
+            return
+        selected = self.look_mode_var.get()
+        selected_preset = next(
+            (preset_id for preset_id, label, _description in PRESET_LOOKS if label == selected),
+            None,
+        )
+        if self.project.look_type in PRESET_IDS:
+            self._preset_strengths[self.project.look_type] = self.project.look_strength
+        if selected == "オリジナル":
+            if self.project.look_type == "custom_lut":
+                self._loaded_look_strength = self.project.look_strength
+            self.project.look_type = "original"
+            self.project.look_lut_path = None
+            self.project.look_strength = 1.0
+        elif selected_preset is not None:
+            self.project.look_type = selected_preset
+            self.project.look_lut_path = None
+            self.project.look_strength = self._preset_strengths.get(selected_preset, 1.0)
+        elif selected == "カスタムLUT" and self._loaded_look_lut_path:
+            try:
+                validate_cube(self._loaded_look_lut_path)
+            except LookError as exc:
+                self.preview_logger.warning("LOOK LUT unavailable: %s", exc)
+                self._look_warning = "このLUTを読み込めませんでした"
+                self._loaded_look_lut_path = None
+                self.look_mode_var.set("オリジナル")
+                self._refresh_look_display()
+                messagebox.showerror("LOOK", "このLUTを読み込めませんでした。")
+                return
+            self.project.look_type = "custom_lut"
+            self.project.look_lut_path = self._loaded_look_lut_path
+            self.project.look_strength = self._loaded_look_strength
+        elif selected == "カスタムLUT":
+            self.choose_look_lut()
+            return
+        else:
+            self._refresh_look_display()
+            return
+        self._look_warning = ""
+        self._refresh_look_display()
+        self._mark_preview_stale()
+        self._refresh_preview()
+
+    def choose_look_lut(self) -> None:
+        path = filedialog.askopenfilename(
+            title="カスタムLUTを読み込む", filetypes=[("3D LUT", "*.cube")]
+        )
+        if not path:
+            self._refresh_look_display()
+            return
+        try:
+            validate_cube(path)
+        except LookError as exc:
+            self.preview_logger.warning("LOOK LUT rejected: %s", exc)
+            self._refresh_look_display()
+            messagebox.showerror("LOOK", "このLUTを読み込めませんでした。")
+            return
+        self._loaded_look_lut_path = str(Path(path).resolve())
+        self._look_warning = ""
+        self.project.look_type = "custom_lut"
+        self.project.look_lut_path = self._loaded_look_lut_path
+        self.project.look_strength = 1.0
+        self._loaded_look_strength = 1.0
+        self._refresh_look_display()
+        self._mark_preview_stale()
+        self._refresh_preview()
+        self.status_var.set(f"LOOKを読み込みました: {Path(path).name}")
+
+    def _on_look_strength_changed(self, value: str) -> None:
+        if self._suspend_dirty or self.project.look_type not in ({"custom_lut"} | PRESET_IDS):
+            return
+        strength = max(0.0, min(round(float(value)) / 100, 1.0))
+        self.look_strength_label_var.set(f"{round(strength * 100)}%")
+        if abs(self.project.look_strength - strength) < 0.0001:
+            return
+        self.project.look_strength = strength
+        if self.project.look_type in PRESET_IDS:
+            self._preset_strengths[self.project.look_type] = strength
+        else:
+            self._loaded_look_strength = strength
+        self._mark_preview_stale()
+        self._refresh_preview()
+
     def auto_compose(self) -> None:
         if not self.project.cuts:
-            messagebox.showinfo("Mini Log", "先に画像を追加してください。")
+            messagebox.showinfo("Mini Log", "先に画像または動画を追加してください。")
             return
         self.project.auto_compose()
         self.selected_index = 0
@@ -1792,10 +2514,14 @@ class MiniLogApp:
     def play_preview(self, from_selected: bool = False) -> None:
         if not self.preview_path.is_file() or self.preview_project_snapshot is None:
             return
+        self.audio_audition.stop()
         start = 0.0
         if from_selected and self.selected_index is not None:
             start = self.preview_project_snapshot.cut_start_time(self.selected_index)
-        self.player.play(self.preview_path, start, self.preview_project_snapshot.total_duration())
+        self.player.play(
+            self.preview_path, start, self.preview_project_snapshot.total_duration(),
+            self._preview_display_size(self.preview_project_snapshot),
+        )
 
     def stop_preview(self) -> None:
         self.player.stop()
@@ -1843,6 +2569,37 @@ class MiniLogApp:
         if not self.preview_generating and not self.exporting:
             self._hide_progress()
 
+    def new_project(self) -> None:
+        if self.exporting or self.preview_generating:
+            messagebox.showinfo("処理中です", "Previewまたは書き出しの完了後に新しいプロジェクトを開始してください。")
+            return
+        if self._project_signature() != self._saved_project_signature:
+            confirmed = messagebox.askyesno(
+                "新しいプロジェクト",
+                "現在の編集内容を消して、新しいプロジェクトを始めますか？\n\n保存していない変更は失われます。",
+                icon="warning",
+            )
+            if not confirmed:
+                return
+
+        self.audio_audition.stop()
+        theme = self.project.theme
+        self.project = Project(theme=theme)
+        self._loaded_look_lut_path = None
+        self._loaded_look_strength = 1.0
+        self._preset_strengths.clear()
+        self._look_warning = ""
+        self.project_path = None
+        self.selected_index = None
+        self.selected_cut_ids.clear()
+        self.video_preview_frame_cache.clear()
+        self.last_export = None
+        self.result_actions.pack_forget()
+        self._reset_preview()
+        self._refresh_all()
+        self._saved_project_signature = self._project_signature()
+        self.status_var.set("新しいプロジェクトを開始しました")
+
     def save_project(self) -> None:
         self._sync_project_settings()
         if not self.project_path:
@@ -1856,6 +2613,7 @@ class MiniLogApp:
             self.project_path = Path(path)
         try:
             self.project.save(self.project_path)
+            self._saved_project_signature = self._project_signature()
             self.status_var.set(f"保存しました: {self.project_path.name}")
         except OSError as exc:
             messagebox.showerror("保存できませんでした", str(exc))
@@ -1868,13 +2626,19 @@ class MiniLogApp:
         if not path:
             return
         try:
+            self.audio_audition.stop()
             self.project = Project.load(path)
+            self._loaded_look_lut_path = None
+            self._loaded_look_strength = 1.0
+            self._preset_strengths.clear()
+            self._look_warning = ""
             self._reset_preview()
             self.project_path = Path(path)
             self.selected_index = 0 if self.project.cuts else None
             self.selected_cut_ids = {self.project.cuts[0].id} if self.project.cuts else set()
             self.status_var.set(f"開きました: {self.project_path.name}")
             self._refresh_all()
+            self._saved_project_signature = self._project_signature()
         except (OSError, ValueError, TypeError) as exc:
             messagebox.showerror("プロジェクトを開けませんでした", str(exc))
 
@@ -1971,6 +2735,7 @@ class MiniLogApp:
             subprocess.Popen(["explorer", "/select,", str(self.last_export)])
 
     def _on_close(self) -> None:
+        self.audio_audition.close()
         self.player.close()
         try:
             self.preview_temp.cleanup()

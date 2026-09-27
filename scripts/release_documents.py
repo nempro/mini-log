@@ -25,24 +25,26 @@ def sha256sum(path: Path) -> str:
 def distribution_readme() -> str:
     return f"""{APP_NAME} {__version__}
 
-Mini Logは、複数の写真を並べて短い縦型動画を作るWindows向けツールです。
+Mini Logは、写真と短い動画を並べてVlogを作るWindows向けツールです。
 
 ■ 主な機能
-・複数画像の追加
+・画像とMP4 / MOV動画の追加
 ・静止画 / 動画風表示
 ・Zoom / Pan
-・表示時間調整
+・表示時間調整、複数カットの一括変更
 ・カットごとのCaption
-・Captionのフォント / サイズ / 位置 / Motion
+・Captionのスタイル / フォント / サイズ / 位置 / Motion
+・カット間の切り替え
+・動画全体のLOOK（内蔵プリセット / カスタムLUT）
 ・BGM
 ・カット音声
 ・Preview
 ・MP4書き出し
-・Project保存 / 復元
+・Projectの新規作成 / 保存 / 復元
 ・春 / 夏 / 秋 / 冬テーマ
 
 ■ 基本操作
-1. 画像を追加
+1. 画像または動画を追加
 2. 順番や表示時間を調整
 3. 必要に応じてCaption / BGM / カット音声を設定
 4. Previewを確認

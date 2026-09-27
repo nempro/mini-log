@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from .models import SUPPORTED_AUDIO_SUFFIXES, Cut, Project
+from .look_engine import PRESET_IDS, ffmpeg_look_filter, validate_cube, write_preset_cube
+from .models import CAPTION_STYLES, SUPPORTED_AUDIO_SUFFIXES, Cut, Project
 from .resources import bundled_tool_candidates
 
 
@@ -34,6 +36,11 @@ class RenderSettings:
 
 FINAL_RENDER = RenderSettings(WIDTH, HEIGHT, FPS, MOTION_SCALE, "medium", 20, False)
 PREVIEW_RENDER = RenderSettings(360, 640, FPS, 2, "ultrafast", 26, True)
+
+
+def settings_for_project(project: Project, base: RenderSettings) -> RenderSettings:
+    width, height = project.output_dimensions(min(base.width, base.height))
+    return replace(base, width=width, height=height)
 
 
 class ExportError(RuntimeError):
@@ -85,6 +92,54 @@ def find_ffprobe(ffmpeg_path: str | None = None) -> str | None:
     return shutil.which("ffprobe")
 
 
+def probe_video(path: str | Path) -> tuple[float, bool]:
+    """Read duration and first audio-stream presence using FFmpeg itself."""
+    ffmpeg = find_ffmpeg()
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+    details = result.stderr
+    duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", details)
+    if duration_match is None:
+        raise ExportError("動画の長さを読み取れません。MP4またはMOVか確認してください。")
+    hours, minutes, seconds = duration_match.groups()
+    duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    if duration <= 0:
+        raise ExportError("長さが0秒の動画は追加できません。")
+    return duration, bool(re.search(r"Stream #\d+:\d+(?:\[[^]]+\])?(?:\([^)]*\))?: Audio:", details))
+
+
+def probe_video_dimensions(path: str | Path) -> tuple[int, int]:
+    """Read display dimensions of the first video stream using bundled FFmpeg."""
+    result = subprocess.run(
+        [find_ffmpeg(), "-hide_banner", "-i", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    for line in result.stderr.splitlines():
+        if "Video:" not in line:
+            continue
+        match = re.search(r"(?<!\d)(\d{2,5})x(\d{2,5})(?!\d)", line)
+        if match:
+            width, height = int(match.group(1)), int(match.group(2))
+            rotation = re.search(r"rotation of\s+(-?\d+(?:\.\d+)?) degrees", result.stderr)
+            if rotation and round(float(rotation.group(1))) % 180 != 0:
+                width, height = height, width
+            return width, height
+    raise ExportError("動画の画面サイズを読み取れません。")
+
+
 def _style_filter(style: str, settings: RenderSettings = FINAL_RENDER) -> str:
     if style == "Soft":
         return "eq=brightness=0.045:contrast=0.92:saturation=0.90"
@@ -104,7 +159,15 @@ def build_video_filter(
     settings: RenderSettings = FINAL_RENDER,
 ) -> str:
     denominator = max(frames - 1, 1)
-    if cut.type == "Motion":
+    if cut.type == "Video":
+        filters = [
+            f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase:flags=lanczos",
+            f"crop={settings.width}:{settings.height}",
+            "setsar=1",
+            _style_filter(style, settings),
+            f"fps={settings.fps}",
+        ]
+    elif cut.type == "Motion":
         work_width = settings.width * settings.motion_scale
         work_height = settings.height * settings.motion_scale
         progress = f"on/{denominator}"
@@ -196,11 +259,14 @@ def build_cut_caption_panel(
     frame_height: int,
     caption_font: str = "gothic",
     caption_size: str = "medium",
+    caption_style: str = "band",
 ) -> Image.Image:
     """Build the shared caption artwork used by UI preview and video renders."""
     cleaned = text.strip()
     if not cleaned:
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    if caption_style not in CAPTION_STYLES:
+        caption_style = "band"
 
     size_scales = {"small": 0.044, "medium": 0.054, "large": 0.066}
     minimum_sizes = {"small": 14, "medium": 18, "large": 21}
@@ -226,19 +292,34 @@ def build_cut_caption_panel(
         (min(round(frame_width * 0.92), text_width + padding_x * 2), text_height + padding_y * 2),
         (0, 0, 0, 0),
     )
-    draw = ImageDraw.Draw(panel)
-    radius = max(8, round(font_size * 0.28))
-    draw.rounded_rectangle((0, 0, panel.width - 1, panel.height - 1), radius=radius, fill=(0, 0, 0, 150))
     stroke_width = max(1, round(font_size * 0.035))
+    text_origin = ((panel.width - text_width) / 2 - bounds[0], padding_y - bounds[1])
+    if caption_style == "shadow":
+        shadow = Image.new("RGBA", panel.size, (0, 0, 0, 0))
+        offset = max(2, round(font_size * 0.05))
+        ImageDraw.Draw(shadow).multiline_text(
+            (text_origin[0] + offset, text_origin[1] + offset), rendered,
+            font=font, fill=(0, 0, 0, 210), align="center", spacing=spacing,
+        )
+        panel.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(max(2, round(font_size * 0.06)))))
+    draw = ImageDraw.Draw(panel)
+    if caption_style in {"band", "soft_band"}:
+        radius = max(8, round(font_size * 0.28))
+        opacity = 150 if caption_style == "band" else 85
+        draw.rounded_rectangle(
+            (0, 0, panel.width - 1, panel.height - 1), radius=radius, fill=(0, 0, 0, opacity)
+        )
+    if caption_style == "outline":
+        stroke_width = max(2, round(font_size * 0.075))
     draw.multiline_text(
-        ((panel.width - text_width) / 2 - bounds[0], padding_y - bounds[1]),
+        text_origin,
         rendered,
         font=font,
         fill=(255, 255, 255, 255),
         align="center",
         spacing=spacing,
-        stroke_width=stroke_width,
-        stroke_fill=(0, 0, 0, 220),
+        stroke_width=stroke_width if caption_style != "shadow" else 0,
+        stroke_fill=(0, 0, 0, 235 if caption_style == "outline" else 220),
     )
     return panel
 
@@ -257,13 +338,16 @@ def build_cut_caption_filter(
     settings: RenderSettings,
     panel_width: int,
     panel_height: int,
+    display_duration: float | None = None,
+    start_time: float = 0.0,
 ) -> tuple[str, str]:
     """Return caption input filtering and overlay y expression."""
-    fade = min(0.25, max(0.08, cut.duration / 4))
-    fade_out = max(0.0, cut.duration - fade)
+    duration = display_duration if display_duration is not None else cut.effective_duration()
+    fade = min(0.25, max(0.08, duration / 4))
+    fade_out = max(0.0, duration - fade)
     filters = ["format=rgba"]
     if cut.caption_motion == "soft_zoom":
-        grow_frames = max(1, round(min(0.50, cut.duration / 3) * settings.fps))
+        grow_frames = max(1, round(min(0.50, duration / 3) * settings.fps))
         filters.append(
             "scale="
             f"w='max(2,trunc(iw*(0.94+0.06*min(n/{grow_frames}\\,1))/2)*2)':"
@@ -285,7 +369,8 @@ def build_cut_caption_filter(
         base_y = "main_h-overlay_h-main_h*0.10"
     if cut.caption_motion == "slide_up":
         distance = max(10, round(settings.height * 0.045))
-        base_y = f"({base_y})+{distance}*(1-min(t/{fade:.3f}\\,1))"
+        local_time = "t" if start_time == 0 else f"(t-{start_time:.3f})"
+        base_y = f"({base_y})+{distance}*(1-min({local_time}/{fade:.3f}\\,1))"
     return ",".join(filters), base_y
 
 
@@ -311,34 +396,41 @@ def _render_cut(
     style: str,
     output: Path,
     settings: RenderSettings,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
+    include_caption: bool = True,
 ) -> None:
-    frames = max(1, round(cut.duration * settings.fps))
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-loop",
-        "1",
-        "-framerate",
-        str(settings.fps),
-        "-i",
-        cut.source_path,
-    ]
-    if cut.caption_text.strip():
+    duration = cut.effective_duration()
+    frames = max(1, round(duration * settings.fps))
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if cut.type == "Video":
+        command.extend(["-i", cut.source_path])
+    else:
+        command.extend(["-loop", "1", "-framerate", str(settings.fps), "-i", cut.source_path])
+    if include_caption and cut.caption_text.strip():
         panel = build_cut_caption_panel(
             cut.caption_text,
             settings.width,
             settings.height,
             cut.caption_font,
             cut.caption_size,
+            cut.caption_style,
         )
         panel_path = output.with_suffix(".caption.png")
         panel.save(panel_path)
         caption_filter, overlay_y = build_cut_caption_filter(
             cut, settings, panel.width, panel.height
         )
+        final_filters = [
+            f"overlay=x=(main_w-overlay_w)/2:y='{overlay_y}':shortest=1",
+            "format=yuv420p",
+        ]
+        if fade_in > 0:
+            final_filters.append(f"fade=t=in:st=0:d={fade_in:.3f}:color=black")
+        if fade_out > 0:
+            final_filters.append(
+                f"fade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}:color=black"
+            )
         command.extend(
             [
                 "-loop",
@@ -351,17 +443,62 @@ def _render_cut(
                 (
                     f"[0:v]{build_video_filter(cut, style, frames, settings)}[base];"
                     f"[1:v]{caption_filter}[cap];"
-                    f"[base][cap]overlay=x=(main_w-overlay_w)/2:y='{overlay_y}':shortest=1,"
-                    "format=yuv420p[v]"
+                    f"[base][cap]{','.join(final_filters)}[v]"
                 ),
                 "-map",
                 "[v]",
             ]
         )
     else:
-        command.extend(["-vf", build_video_filter(cut, style, frames, settings)])
+        video_filter = build_video_filter(cut, style, frames, settings)
+        if fade_in > 0:
+            video_filter += f",fade=t=in:st=0:d={fade_in:.3f}:color=black"
+        if fade_out > 0:
+            video_filter += (
+                f",fade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}:color=black"
+            )
+        command.extend(["-vf", video_filter])
     command.extend(
         [
+            "-frames:v",
+            str(frames),
+            "-t",
+            f"{duration:.3f}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            settings.preset,
+            "-crf",
+            str(settings.crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            str(settings.fps),
+            str(output),
+        ]
+    )
+    _run(command)
+
+
+def _render_black_segment(
+    ffmpeg: str,
+    duration: float,
+    output: Path,
+    settings: RenderSettings,
+) -> None:
+    frames = max(1, round(duration * settings.fps))
+    _run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={settings.width}x{settings.height}:r={settings.fps}:d={duration:.3f}",
             "-frames:v",
             str(frames),
             "-an",
@@ -378,7 +515,211 @@ def _render_cut(
             str(output),
         ]
     )
+
+
+def _combine_cut_segments(
+    ffmpeg: str,
+    project: Project,
+    cut_segments: list[Path],
+    output: Path,
+    workdir: Path,
+    settings: RenderSettings,
+) -> None:
+    if not cut_segments:
+        raise ExportError("動画にするカットがありません。")
+
+    black_segments: dict[int, Path] = {}
+    inputs = list(cut_segments)
+    for index, cut in enumerate(project.cuts[:-1]):
+        if cut.transition_type == "dip_black":
+            hold = project.effective_transition_duration(index) / 3
+            black_path = workdir / f"transition-black-{index + 1:04d}.mp4"
+            _render_black_segment(ffmpeg, hold, black_path, settings)
+            black_segments[index] = black_path
+            inputs.append(black_path)
+
+    input_indexes = {path: index for index, path in enumerate(inputs)}
+    filters: list[str] = []
+    labels: list[str] = []
+    for index, segment in enumerate(cut_segments):
+        label = f"cut{index}"
+        labels.append(label)
+        filters.append(
+            f"[{input_indexes[segment]}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={settings.fps}[{label}]"
+        )
+    black_labels: dict[int, str] = {}
+    for index, (cut_index, segment) in enumerate(black_segments.items()):
+        label = f"black{index}"
+        black_labels[cut_index] = label
+        filters.append(
+            f"[{input_indexes[segment]}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={settings.fps}[{label}]"
+        )
+
+    current_label = labels[0]
+    current_duration = project.cuts[0].effective_duration()
+    next_output = 0
+    for index, cut in enumerate(project.cuts[:-1]):
+        following_label = f"[{labels[index + 1]}]"
+        if cut.transition_type == "crossfade":
+            transition_duration = project.effective_transition_duration(index)
+            output_label = f"joined{next_output}"
+            filters.append(
+                f"[{current_label}]{following_label}"
+                f"xfade=transition=fade:duration={transition_duration:.3f}:"
+                f"offset={max(0.0, current_duration - transition_duration):.3f}[{output_label}]"
+            )
+            current_duration += project.cuts[index + 1].effective_duration() - transition_duration
+            current_label = output_label
+            next_output += 1
+            continue
+
+        if index in black_labels:
+            output_label = f"joined{next_output}"
+            filters.append(
+                f"[{current_label}][{black_labels[index]}]concat=n=2:v=1:a=0[{output_label}]"
+            )
+            current_label = output_label
+            current_duration += project.effective_transition_duration(index) / 3
+            next_output += 1
+
+        output_label = f"joined{next_output}"
+        filters.append(
+            f"[{current_label}]{following_label}concat=n=2:v=1:a=0[{output_label}]"
+        )
+        current_label = output_label
+        current_duration += project.cuts[index + 1].effective_duration()
+        next_output += 1
+
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for segment in inputs:
+        command.extend(["-i", str(segment)])
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            f"[{current_label}]",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            settings.preset,
+            "-crf",
+            str(settings.crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            str(settings.fps),
+            "-t",
+            f"{project.video_duration():.3f}",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+    )
     _run(command)
+
+
+def _apply_project_look(
+    ffmpeg: str,
+    project: Project,
+    video: Path,
+    workdir: Path,
+    settings: RenderSettings,
+) -> Path:
+    if project.look_strength <= 0 or project.look_type == "original":
+        return video
+    local_lut = workdir / "look.cube"
+    if project.look_type in PRESET_IDS:
+        write_preset_cube(project.look_type, local_lut)
+    elif project.look_type == "custom_lut" and project.look_lut_path:
+        validate_cube(project.look_lut_path)
+        shutil.copyfile(project.look_lut_path, local_lut)
+    else:
+        return video
+    output = workdir / "looked-cuts.mp4"
+    _run(
+        [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(video),
+            "-filter_complex", ffmpeg_look_filter(local_lut, project.look_strength),
+            "-map", "[v]", "-an", "-c:v", "libx264", "-preset", settings.preset,
+            "-crf", str(settings.crf), "-pix_fmt", "yuv420p", "-r", str(settings.fps),
+            "-t", f"{project.video_duration():.3f}", "-movflags", "+faststart", str(output),
+        ]
+    )
+    return output
+
+
+def _overlay_cut_captions(
+    ffmpeg: str,
+    project: Project,
+    video: Path,
+    workdir: Path,
+    settings: RenderSettings,
+) -> Path:
+    caption_cuts = [(index, cut) for index, cut in enumerate(project.cuts) if cut.caption_text.strip()]
+    if not caption_cuts:
+        return video
+
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video)]
+    filters: list[str] = []
+    current = "0:v"
+    for input_index, (index, cut) in enumerate(caption_cuts, start=1):
+        panel = build_cut_caption_panel(
+            cut.caption_text, settings.width, settings.height,
+            cut.caption_font, cut.caption_size, cut.caption_style,
+        )
+        panel_path = workdir / f"look-caption-{index + 1:04d}.png"
+        panel.save(panel_path)
+        command.extend(["-loop", "1", "-framerate", str(settings.fps), "-i", str(panel_path)])
+
+        previous = project.cuts[index - 1] if index > 0 else None
+        incoming_type = previous.transition_type if previous is not None else "cut"
+        incoming_transition = project.effective_transition_duration(index - 1) if previous is not None else 0.0
+        outgoing_type = cut.transition_type if index < len(project.cuts) - 1 else "cut"
+        outgoing_transition = project.effective_transition_duration(index)
+        start_trim = incoming_transition / 2 if incoming_type == "crossfade" else 0.0
+        end_trim = outgoing_transition / 2 if outgoing_type == "crossfade" else 0.0
+        duration = cut.effective_duration() - start_trim - end_trim
+        start = project.cut_start_time(index) + start_trim
+        end = start + duration
+
+        caption_filter, overlay_y = build_cut_caption_filter(
+            cut, settings, panel.width, panel.height, display_duration=duration, start_time=start
+        )
+        caption_filters = [f"trim=duration={duration:.3f}", caption_filter]
+        if incoming_type in {"crossfade", "fade", "dip_black"}:
+            fade_in = incoming_transition / (2 if incoming_type in {"crossfade", "fade"} else 3)
+            caption_filters.append(f"fade=t=in:st=0:d={min(fade_in, duration / 2):.3f}:alpha=1")
+        if outgoing_type in {"crossfade", "fade", "dip_black"}:
+            fade_out = outgoing_transition / (2 if outgoing_type in {"crossfade", "fade"} else 3)
+            fade_out = min(fade_out, duration / 2)
+            caption_filters.append(
+                f"fade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}:alpha=1"
+            )
+        caption_filters.append(f"setpts=PTS-STARTPTS+{start:.3f}/TB")
+        filters.append(f"[{input_index}:v]{','.join(caption_filters)}[caption{input_index}]")
+        output_label = f"captioned{input_index}"
+        filters.append(
+            f"[{current}][caption{input_index}]"
+            f"overlay=x=(main_w-overlay_w)/2:y='{overlay_y}':"
+            f"eof_action=pass:repeatlast=0:shortest=0:"
+            f"enable='between(t\\,{start:.3f}\\,{end:.3f})'[{output_label}]"
+        )
+        current = output_label
+
+    output = workdir / "captioned-cuts.mp4"
+    command.extend(
+        [
+            "-filter_complex", ";".join(filters), "-map", f"[{current}]", "-an",
+            "-c:v", "libx264", "-preset", settings.preset, "-crf", str(settings.crf),
+            "-pix_fmt", "yuv420p", "-r", str(settings.fps),
+            "-t", f"{project.video_duration():.3f}", "-movflags", "+faststart", str(output),
+        ]
+    )
+    _run(command)
+    return output
 
 
 def _font_path(preset: str = "gothic") -> Path:
@@ -546,17 +887,39 @@ def build_cut_audio_filter(cut_duration: float, volume: float, start_time: float
 
 def _cut_audio_tracks(project: Project) -> list[tuple[Path, float, float, float]]:
     tracks: list[tuple[Path, float, float, float]] = []
-    start_time = 0.0
-    for cut in project.cuts:
+    for index, cut in enumerate(project.cuts):
         audio_path = Path(cut.audio_path) if cut.audio_path else None
         if (
             audio_path is not None
             and audio_path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES
             and audio_path.is_file()
         ):
-            tracks.append((audio_path, start_time, cut.duration, cut.audio_volume))
-        start_time += cut.duration
+            tracks.append((audio_path, project.cut_start_time(index), cut.effective_duration(), cut.audio_volume))
     return tracks
+
+
+def _video_audio_tracks(project: Project) -> list[tuple[Path, float, float, float]]:
+    tracks: list[tuple[Path, float, float, float]] = []
+    for index, cut in enumerate(project.cuts):
+        if cut.type == "Video" and cut.source_has_audio and cut.use_source_audio:
+            tracks.append((Path(cut.source_path), project.cut_start_time(index), cut.effective_duration(), cut.source_audio_volume))
+    return tracks
+
+
+def build_video_audio_filter(cut_duration: float, volume: float, start_time: float) -> str:
+    cut_duration = max(0.0, float(cut_duration))
+    volume = max(0.0, min(float(volume), 1.0))
+    delay_ms = max(0, round(float(start_time) * 1000))
+    return ",".join(
+        [
+            "aresample=48000",
+            "aformat=sample_fmts=fltp:channel_layouts=stereo",
+            f"volume={volume:.4f}",
+            f"atrim=start=0:duration={cut_duration:.3f}",
+            "asetpts=PTS-STARTPTS",
+            f"adelay={delay_ms}|{delay_ms}",
+        ]
+    )
 
 
 def _mux_project_audio(
@@ -566,7 +929,9 @@ def _mux_project_audio(
     project: Project,
     bgm: Path | None,
     cut_audio_tracks: list[tuple[Path, float, float, float]],
+    video_audio_tracks: list[tuple[Path, float, float, float]] | None = None,
 ) -> None:
+    video_audio_tracks = video_audio_tracks or []
     duration = project.total_duration()
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video)]
     filters: list[str] = []
@@ -584,6 +949,14 @@ def _mux_project_audio(
         label = f"cut_audio_{track_index}"
         filters.append(
             f"[{input_index}:a]{build_cut_audio_filter(cut_duration, volume, start_time)}[{label}]"
+        )
+        labels.append(label)
+        input_index += 1
+    for track_index, (path, start_time, cut_duration, volume) in enumerate(video_audio_tracks):
+        command.extend(["-i", str(path)])
+        label = f"video_audio_{track_index}"
+        filters.append(
+            f"[{input_index}:a]{build_video_audio_filter(cut_duration, volume, start_time)}[{label}]"
         )
         labels.append(label)
         input_index += 1
@@ -629,6 +1002,7 @@ def export_project(
     errors = project.validate_for_export()
     if errors:
         raise ExportError("\n".join(errors))
+    settings = settings_for_project(project, settings)
 
     ffmpeg = find_ffmpeg()
     output = Path(output_path).resolve()
@@ -638,59 +1012,100 @@ def export_project(
 
     with tempfile.TemporaryDirectory(prefix="mini-log-") as temporary:
         workdir = Path(temporary)
-        segments: list[Path] = []
-        for index, cut in enumerate(project.cuts, start=1):
-            report(f"カット {index}/{len(project.cuts)} を書き出し中…", (index - 1) / (total_segments + 1))
-            segment = workdir / f"cut-{index:04d}.mp4"
-            _render_cut(ffmpeg, cut, project.style, segment, settings)
-            segments.append(segment)
+        look_enabled = (
+            (
+                project.look_type in PRESET_IDS
+                or project.look_type == "custom_lut"
+                and bool(project.look_lut_path)
+                and Path(project.look_lut_path).is_file()
+            )
+            and project.look_strength > 0
+        )
+        cut_segments: list[Path] = []
+        for index, cut in enumerate(project.cuts):
+            report(f"カット {index + 1}/{len(project.cuts)} を書き出し中…", index / (total_segments + 1))
+            incoming = project.cuts[index - 1] if index > 0 else None
+            incoming_duration = 0.0
+            if incoming is not None and incoming.transition_type in {"fade", "dip_black"}:
+                parts = 2 if incoming.transition_type == "fade" else 3
+                incoming_duration = project.effective_transition_duration(index - 1) / parts
+            outgoing_duration = 0.0
+            if index < len(project.cuts) - 1 and cut.transition_type in {"fade", "dip_black"}:
+                parts = 2 if cut.transition_type == "fade" else 3
+                outgoing_duration = project.effective_transition_duration(index) / parts
+            fade_limit = cut.effective_duration() / 2
+            segment = workdir / f"cut-{index + 1:04d}.mp4"
+            _render_cut(
+                ffmpeg,
+                cut,
+                project.style,
+                segment,
+                settings,
+                fade_in=min(incoming_duration, fade_limit),
+                fade_out=min(outgoing_duration, fade_limit),
+                include_caption=not look_enabled,
+            )
+            cut_segments.append(segment)
+
+        report("カット間の切り替えを適用しています…", len(cut_segments) / (total_segments + 1))
+        cuts_video = workdir / "cuts-video.mp4"
+        _combine_cut_segments(ffmpeg, project, cut_segments, cuts_video, workdir, settings)
+        if look_enabled:
+            report("LOOKを適用しています…", len(cut_segments) / (total_segments + 1))
+            cuts_video = _apply_project_look(ffmpeg, project, cuts_video, workdir, settings)
+            cuts_video = _overlay_cut_captions(ffmpeg, project, cuts_video, workdir, settings)
+        video_only = cuts_video
 
         if project.caption_text.strip():
-            report("終了キャプションを書き出し中…", len(segments) / (total_segments + 1))
+            report("終了キャプションを書き出し中…", (len(cut_segments) + 1) / (total_segments + 1))
             caption = workdir / "caption.mp4"
             _render_caption(ffmpeg, project, workdir, caption, settings)
-            segments.append(caption)
+            manifest = workdir / "concat.txt"
+            manifest.write_text(
+                f"file '{str(cuts_video).replace(chr(92), '/')}\n"
+                f"file '{str(caption).replace(chr(92), '/')}\n",
+                encoding="utf-8",
+            )
+            video_only = workdir / "video-only.mp4"
+            _run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(manifest),
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(video_only),
+                ]
+            )
 
-        manifest = workdir / "concat.txt"
-        manifest.write_text(
-            "".join(f"file '{str(path).replace(chr(92), '/')}'\n" for path in segments),
-            encoding="utf-8",
-        )
         report("1本の動画にまとめています…", total_segments / (total_segments + 1))
         bgm_path = Path(project.bgm_path) if project.bgm_path else None
         has_bgm = bool(bgm_path and bgm_path.is_file())
         cut_audio_tracks = _cut_audio_tracks(project)
-        has_audio = has_bgm or bool(cut_audio_tracks)
-        video_output = workdir / "video-only.mp4" if has_audio else output
-        _run(
-            [
-                ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(manifest),
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(video_output),
-            ]
-        )
+        video_audio_tracks = _video_audio_tracks(project)
+        has_audio = has_bgm or bool(cut_audio_tracks) or bool(video_audio_tracks)
         if has_audio:
             report("音声を追加しています…", 0.95)
             _mux_project_audio(
                 ffmpeg,
-                video_output,
+                video_only,
                 output,
                 project,
                 bgm_path if has_bgm else None,
                 cut_audio_tracks,
+                video_audio_tracks,
             )
+        else:
+            shutil.copyfile(video_only, output)
     report("書き出しが完了しました", 1.0)
     return output

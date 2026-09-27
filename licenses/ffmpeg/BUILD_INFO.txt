@@ -1,5 +1,5 @@
-Mini Log 0.1.0 — bundled FFmpeg build information
-===================================================
+Mini Log — bundled FFmpeg build information
+===========================================
 
 Binary
 ------
