@@ -54,6 +54,33 @@ class FakeSound:
         self.paths.append(path)
 
 
+class FakeScale:
+    def __init__(self, variable, command):
+        self.variable = variable
+        self.command = command
+        self.handlers = {}
+        self.disabled = False
+
+    def winfo_width(self):
+        return 400
+
+    def winfo_height(self):
+        return 26
+
+    def instate(self, states):
+        return self.disabled and "disabled" in states
+
+    def identify(self, _x, _y):
+        return "Horizontal.Scale.track"
+
+    def set(self, value):
+        self.variable.set(value)
+        self.command(value)
+
+    def bind(self, sequence, handler, add=None):
+        self.handlers[sequence] = handler
+
+
 def rms(path: Path) -> float:
     with wave.open(str(path), "rb") as recording:
         samples = array("h", recording.readframes(recording.getnframes()))
@@ -61,6 +88,41 @@ def rms(path: Path) -> float:
 
 
 class AudioAuditionVolumeTests(unittest.TestCase):
+    def test_both_volume_tracks_seek_on_click_and_keep_dragging(self):
+        app = MiniLogApp.__new__(MiniLogApp)
+        app.project = Project(cuts=[Cut(source_path="picture.png")])
+        app.selected_index = 0
+        app._suspend_dirty = False
+        app._suspend_cut_audio = False
+        app.bgm_volume_var = FakeVar(60)
+        app.bgm_volume_label_var = FakeVar("60%")
+        app.cut_audio_volume_var = FakeVar(60)
+        app.cut_audio_volume_label_var = FakeVar("60%")
+        app._mark_preview_stale = Mock()
+
+        for variable, label, value, callback in (
+            (app.bgm_volume_var, app.bgm_volume_label_var, lambda: app.project.bgm_volume,
+             app._on_bgm_volume_changed),
+            (app.cut_audio_volume_var, app.cut_audio_volume_label_var,
+             lambda: app.project.cuts[0].audio_volume, app._on_cut_audio_volume_changed),
+        ):
+            scale = FakeScale(variable, callback)
+            app._enable_volume_track_click(scale)
+            for percent in (0, 25, 50, 75, 100):
+                x = 8 + round(percent * 384 / 100)
+                event = SimpleNamespace(x=x, y=13)
+                self.assertEqual(scale.handlers["<Button-1>"](event), "break")
+                self.assertEqual(label.get(), f"{percent}%")
+                self.assertEqual(value(), percent / 100)
+                scale.handlers["<ButtonRelease-1>"](event)
+            scale.handlers["<Button-1>"](SimpleNamespace(x=104, y=13))
+            scale.handlers["<B1-Motion>"](SimpleNamespace(x=296, y=13))
+            self.assertEqual(value(), 0.75)
+            scale.handlers["<ButtonRelease-1>"](SimpleNamespace(x=296, y=13))
+            scale.disabled = True
+            self.assertIsNone(scale.handlers["<Button-1>"](SimpleNamespace(x=8, y=13)))
+            self.assertEqual(value(), 0.75)
+
     def test_bgm_and_cut_wav_levels_are_monotonic_and_zero_is_silent(self):
         with tempfile.TemporaryDirectory(prefix="mini-log-volume-test-") as folder:
             sources = {}

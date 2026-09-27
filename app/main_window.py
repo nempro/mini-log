@@ -878,6 +878,7 @@ class MiniLogApp:
             state="disabled",
         )
         self.cut_audio_volume_scale.pack(side=LEFT, fill=X, expand=True, padx=(12, 8))
+        self._enable_volume_track_click(self.cut_audio_volume_scale)
         self.cut_audio_volume_label_var = StringVar(value="60%")
         ttk.Label(
             volume_row,
@@ -986,6 +987,7 @@ class MiniLogApp:
             command=self._on_bgm_volume_changed,
         )
         self.bgm_volume_scale.pack(side=LEFT, fill=X, expand=True, padx=(12, 8))
+        self._enable_volume_track_click(self.bgm_volume_scale)
         self.bgm_volume_label_var = StringVar(value="60%")
         ttk.Label(volume_row, textvariable=self.bgm_volume_label_var, style="Panel.TLabel", width=5).pack(side=RIGHT)
         for widget in (self.bgm_box, self.bgm_name_label):
@@ -1514,6 +1516,43 @@ class MiniLogApp:
         if abs(self.project.bgm_volume - volume) > 0.0001:
             self.project.bgm_volume = volume
             self._mark_preview_stale()
+
+    @staticmethod
+    def _enable_volume_track_click(scale: ttk.Scale) -> None:
+        """Make a track click seek immediately, then allow continued fine dragging."""
+        seeking = False
+
+        def seek(event) -> None:
+            width = scale.winfo_width()
+            thumb_pad = min(width // 4, max(4, scale.winfo_height() // 3))
+            travel = max(1, width - 2 * thumb_pad)
+            percent = round((event.x - thumb_pad) * 100 / travel)
+            scale.set(max(0, min(percent, 100)))
+
+        def press(event):
+            nonlocal seeking
+            if scale.instate(["disabled"]) or scale.identify(event.x, event.y).endswith("slider"):
+                return None  # Keep the native thumb drag behavior.
+            seeking = True
+            seek(event)
+            return "break"
+
+        def motion(event):
+            if seeking:
+                seek(event)
+                return "break"
+            return None
+
+        def release(_event):
+            nonlocal seeking
+            if seeking:
+                seeking = False
+                return "break"
+            return None
+
+        scale.bind("<Button-1>", press, add="+")
+        scale.bind("<B1-Motion>", motion, add="+")
+        scale.bind("<ButtonRelease-1>", release, add="+")
 
     def _on_audition_state(self, kind: str | None) -> None:
         self.bgm_audition_button.configure(text="■ 停止" if kind == "bgm" else "▶ 試聴")
