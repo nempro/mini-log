@@ -2,47 +2,65 @@
 
 写真を並べて、一日の小さな記録に。
 
-Mini Logは、画像と短い動画からVlogを作るWindows向けデスクトップツールです。複雑なタイムラインではなく、素材・Caption・BGM・Cut Audio・Previewに絞っています。
+Mini Logは、画像と短い動画を組み合わせて一本の映像を作るWindows向けデスクトップツールです。複雑なタイムラインではなく、素材・Caption・音・LOOK・Previewに絞った軽量Studioです。
+
+Vlogのほか、ツール紹介、簡易プレゼン、電子紙芝居のような映像作りにも使えます。
 
 ## Features
 
-- 画像（JPG / JPEG / PNG / WebP）と動画（MP4 / MOV）の追加、カットD&D並べ替え、Ctrl+クリック複数選択
-- 静止画 / 動画風、Zoom / Pan、0.1秒単位の表示時間調整（Ctrl+Aで全Cut選択・一括変更）
-- Cut Caption（フォント、サイズ、位置、Motion）と終了Caption
-- カットごとの切り替え（カット / フェード / クロスフェード / ブラックを挟む、0.2 / 0.4 / 0.6秒）
-- 動画全体のLOOK（内蔵プリセット5種類、ユーザー所有の `.cube` 3D LUT、強度0〜100%、オリジナルへ切替可能）
-- BGM、Cut Audio、Preview、H.264/AAC MP4書き出し
-- Projectの新規作成・保存 / 復元、春 / 夏 / 秋 / 冬テーマ
+- 画像（JPG / JPEG / PNG / WebP）と動画（MP4 / MOV）の追加
+- Cutカードのドラッグ＆ドロップ並べ替えと、Ctrl+クリックによる複数選択
+- 静止画 / 動画風、Zoom / Pan、表示時間の調整
+- Cut Caption（フォント、サイズ、位置、Motion、スタイル）と終了Caption
+- CutごとのTransition（なし / フェード / クロスフェード / ブラックを挟む）
+- 動画Cutの元音声ON / OFFと音量調整
+- BGM、Cut Audio、音源の試聴
+- 動画全体のLOOK（内蔵プリセット5種類、ユーザー所有の `.cube` 3D LUT、強度調整）
+- Previewの作成と再生
+- Projectの新規作成・保存・復元
+- H.264 / AAC形式のMP4書き出し
+- 春 / 夏 / 秋 / 冬のアプリテーマ
 
 ## Download
 
-公開済みの配布版は [Mini Log 0.1.0 Release](https://github.com/nempro/mini-log/releases/tag/v0.1.0) です。このリポジトリの現行ソースは **0.2.0 Release Candidate** であり、0.1.0の配布ZIPには本ページ記載の新機能はまだ含まれません。0.2.0 RCのローカルビルドは `release/MiniLog-0.2.0-windows.zip` です。ZIPを展開して `MiniLog.exe` を起動してください。Pythonや別途FFmpegの導入は不要です。
+[Mini Log 0.2.0のWindows版をダウンロード](https://github.com/nempro/mini-log/releases/tag/v0.2.0)
+
+Windowsで利用する場合は、Releaseページの **`MiniLog-0.2.0-windows.zip`** をダウンロードしてください。GitHubが自動生成する「Source code」は、配布用アプリ本体ではありません。
+
+ZIPを展開し、フォルダー内の `MiniLog.exe` を起動してください。PythonやFFmpegを別途インストールする必要はありません。展開したフォルダー全体を保持して使用してください。
 
 ## Usage
 
-1. 画像やMP4 / MOV動画を追加し、順番・表示時間・静止画 / 動画風を調整します。動画Cutは素材の先頭から再生し、素材終端または30秒上限で終了します（ループしません）。
-2. 必要に応じてCutごとの切り替え、Caption、BGM、Cut Audioを設定します。切り替えは各カットから次のカットに適用され、最後のカットでは使われません。
-3. Previewで全体を確認し、MP4を書き出します。
+1. `MiniLog-0.2.0-windows.zip` をダウンロードして展開し、`MiniLog.exe` を起動します。
+2. 写真やMP4 / MOV動画をドラッグ＆ドロップするか、「画像 / 動画を追加」から素材を選びます。
+3. Cutカードを並べ替え、表示時間、静止画 / 動画風、動き、Transitionを調整します。
+4. 必要に応じてCut Caption、BGM、Cut Audio、LOOKを設定します。
+5. 「プレビューを作成」で動画全体の流れを確認します。
+6. 「MP4を書き出す」で完成動画を保存します。
 
-新しいProjectでは、最初に追加した画像または動画の縦横比をPreviewとMP4の出力比率に使います。後から別の比率の素材を追加しても比率は変わりません。表示時間の直接入力はEnterまたはフォーカスを外したときに確定します。Ctrl+クリックで複数Cutを選択し、一括で表示時間を変更できます。
+新しいProjectでは、最初に追加した画像または動画の縦横比をPreviewとMP4の出力比率に使います。異なる比率の素材を後から追加しても、Projectの比率は変わりません。
 
-LOOKは「暖色」「色あせ」「レトロ」「寒色」「フィルム」から選ぶだけで使えます。手持ちの `.cube` がある場合はカスタムLUTも読み込めます。強度は0〜100%で調整でき、オリジナルへ戻せます。静止画・動画風・動画Cutと切り替え後の映像へ適用し、Cut Captionと終了Captionには適用しません。内蔵プリセットはProjectの `look_type` にIDで保存されます。カスタムLUTはファイルをProjectへコピーしないため、保存後も元の `.cube` ファイルを保持してください。
+Durationは入力後にEnterを押すか、入力欄からフォーカスを外すと確定します。Ctrl+クリックでCutを複数選択し、表示時間をまとめて変更できます。Ctrl+Aでは全Cutを選択できます。
 
-次の動画を作るときは「新しいプロジェクト」を使います。未保存の編集がある場合は確認が表示されます。季節テーマとPreviewの表示状態は維持されます。
+動画Cutは素材の先頭から再生し、元動画の終端まで使用します。動画はループしません。長い動画ではPreview生成や書き出しに時間がかかる場合があります。
 
-動画Cutでは元動画音声を個別にON / OFFし、音量を調整できます。元動画音声、Cut Audio、BGMは同時に使用でき、音量はそれぞれの設定で調整します。動画CutにもCut Audioを追加できます。
+LOOKは「暖色」「色あせ」「レトロ」「寒色」「フィルム」から選べます。手持ちの `.cube` 3D LUTも読み込めます。強度は0〜100%で調整でき、オリジナルへ戻せます。LOOKは素材映像へ適用され、Cut Captionと終了Captionには適用されません。
+
+Cut Audioはカット開始と同時に再生します。動画元音声、Cut Audio、BGMはそれぞれ個別に設定でき、同時に使用できます。
+
+Projectファイルは保存して、後から再読込できます。Custom LUTはProjectへコピーされないため、保存後も元の `.cube` ファイルを保持してください。次の動画を作るときは「新しいプロジェクト」を使います。
 
 ## Supported Environment
 
-Windows 10 / 11（64-bit）です。配布形式はInstallerなしのZIP展開型です。
+Windows 10 / 11（64-bit）に対応しています。配布形式はインストーラー不要のZIP展開型です。
 
 ## Notes
 
-未署名EXEのため、Windows SmartScreen等の警告が表示される場合があります。配布フォルダ全体を保持して使用してください。
+未署名EXEのため、Windows SmartScreenなどの警告が表示される場合があります。
 
 ## License / Third-party
 
-Mini Log自身のLicenseは未設定です。配布物に含まれるFFmpeg、Python runtime、Pillow、tkinterdnd2、PyInstallerなどのライセンスは、配布ZIP内の `THIRD_PARTY_NOTICES.txt` と `licenses/` に収録します。FFmpegはGPLv3系の実バイナリを同梱します。
+Mini Log自身のLicenseは未設定です。配布物に含まれるFFmpeg、Python runtime、Pillow、tkinterdnd2、PyInstallerなどのライセンス情報は、配布ZIP内の `THIRD_PARTY_NOTICES.txt` と `licenses/` に収録しています。FFmpegはGPLv3系の実バイナリを同梱しています。
 
 ## Development build
 
@@ -51,6 +69,3 @@ python -m pip install -r requirements.txt
 python -m pip install -r requirements-build.txt
 python scripts/build_windows.py
 python tests/release_prep_acceptance.py
-```
-
-出力は `release/MiniLog-0.2.0/` と `release/MiniLog-0.2.0-windows.zip` です。
